@@ -1,0 +1,43 @@
+From 59ecb17c3bd9eeeacee6700a0c8c874712112760 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:11 +0530
+Subject: MIPS: csum_partial: prefetch inside the buffer on its 128-byte loop
+
+csum_partial runs without prefetch on non-coherent DMA for the same
+reason as memcpy. Its 128-byte loop now prefetches the next 128 bytes
+while at least 256 bytes remain, so a prefetch never leaves the buffer.
+
+SF19A2890, WiFi TCP download: csum_partial 20% -> 7.6% of busy time.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ arch/mips/lib/csum_partial.S | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+--- a/arch/mips/lib/csum_partial.S
++++ b/arch/mips/lib/csum_partial.S
+@@ -190,6 +190,24 @@ EXPORT_SYMBOL(csum_partial)
+ 	 andi	t2, a1, 0x40
+ 
+ .Lmove_128bytes:
++#ifdef CONFIG_CPU_HAS_PREFETCH
++	/*
++	 * Network RX checksums data the device just DMAed, so every line
++	 * misses. Prefetch the next 128 bytes, but only while they lie
++	 * wholly inside the buffer (t8 counts the 128-byte blocks left):
++	 * on non-coherent DMA a prefetch past the end could pull in a line
++	 * of a buffer the device still owns, and nothing invalidates it
++	 * again before the CPU reads it.
++	 */
++	sltiu	t9, t8, 2
++	bnez	t9, 2f
++	 nop
++	pref	0, 0x80(src)
++	pref	0, 0xa0(src)
++	pref	0, 0xc0(src)
++	pref	0, 0xe0(src)
++2:
++#endif
+ 	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x20, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x40, sum, t0, t1, t3, t4)

@@ -1,0 +1,161 @@
+From bc5a956ad303c2915e4e2f3d22191afc260c7085 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:11 +0530
+Subject: MIPS: memcpy: prefetch the source of user copies on non-coherent DMA
+
+memcpy.S drops all prefetching when DMA is non-coherent: a prefetch
+running past the end of a buffer can pull in a line of a buffer a
+device is writing, and on CPUs that need no post-DMA flush the CPU then
+reads that stale line.
+
+- copy_from_user reads user memory, never a DMA buffer: prefetch its
+  source freely (__raw_copy_from_user_pref).
+- copy_to_user reads kernel memory, often an skb a device just wrote:
+  prefetch its source only while the whole prefetched line lies inside
+  the buffer (__raw_copy_to_user_pref).
+
+Kernel memcpy is unchanged.
+
+SF19A2890 (interAptiv, DMA non-coherent), router-terminated iperf3:
+TCP up 300 -> 355-365 Mbit/s; copy_to_user 23% -> 18% of busy time on
+a WiFi download.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ arch/mips/include/asm/uaccess.h | 19 ++++++++++--
+ arch/mips/lib/memcpy.S          | 53 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 69 insertions(+), 3 deletions(-)
+
+--- a/arch/mips/include/asm/uaccess.h
++++ b/arch/mips/include/asm/uaccess.h
+@@ -386,6 +386,21 @@ do {									\
+ extern size_t __raw_copy_from_user(void *__to, const void *__from, size_t __n);
+ extern size_t __raw_copy_to_user(void *__to, const void *__from, size_t __n);
+ 
++/* See PREF_USER_SRC in arch/mips/lib/memcpy.S */
++#if defined(CONFIG_CPU_HAS_PREFETCH) && defined(CONFIG_DMA_NONCOHERENT) && \
++	!defined(CONFIG_MIPS_MALTA) && !defined(CONFIG_CPU_MIPSR6) && \
++	!defined(CONFIG_EVA) && !defined(CONFIG_HAVE_PLAT_MEMCPY)
++size_t __raw_copy_from_user_pref(void *__to, const void *__from, size_t __n);
++#define __RAW_COPY_FROM_USER __raw_copy_from_user_pref
++size_t __raw_copy_to_user_pref(void *__to, const void *__from, size_t __n);
++#define __RAW_COPY_TO_USER __raw_copy_to_user_pref
++#else
++#define __RAW_COPY_FROM_USER __raw_copy_from_user
++#define __RAW_COPY_TO_USER __raw_copy_to_user
++#endif
++/* expand __RAW_COPY_FROM_USER before __MODULE_JAL stringifies it */
++#define __MODULE_JAL_X(destination) __MODULE_JAL(destination)
++
+ static inline unsigned long
+ raw_copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
+@@ -399,7 +414,7 @@ raw_copy_from_user(void *to, const void
+ 
+ 	__asm__ __volatile__(
+ 		".set\tnoreorder\n\t"
+-		__MODULE_JAL(__raw_copy_from_user)
++		__MODULE_JAL_X(__RAW_COPY_FROM_USER)
+ 		".set\tnoat\n\t"
+ 		__UA_ADDU "\t$1, %1, %2\n\t"
+ 		".set\tat\n\t"
+@@ -424,7 +439,7 @@ raw_copy_to_user(void __user *to, const
+ 	__cu_len_r = (n);
+ 
+ 	__asm__ __volatile__(
+-		__MODULE_JAL(__raw_copy_to_user)
++		__MODULE_JAL_X(__RAW_COPY_TO_USER)
+ 		: "+r" (__cu_to_r), "+r" (__cu_from_r), "+r" (__cu_len_r)
+ 		:
+ 		: "$8", "$9", "$10", "$11", "$12", "$14", "$15", "$24", "$31",
+--- a/arch/mips/lib/memcpy.S
++++ b/arch/mips/lib/memcpy.S
+@@ -21,7 +21,17 @@
+  * Prefetching may be fatal on some systems if we're prefetching beyond the
+  * end of memory on some systems.  It's also a seriously bad idea on non
+  * dma-coherent systems.
++ *
++ * When DMA non-coherence is the only reason, copy_from_user still gets a
++ * copy that prefetches its source (__raw_copy_from_user_pref): that is
++ * user memory, never a buffer a device writes into. Keep this condition
++ * in sync with asm/uaccess.h.
+  */
++#if defined(CONFIG_CPU_HAS_PREFETCH) && defined(CONFIG_DMA_NONCOHERENT) && \
++    !defined(CONFIG_MIPS_MALTA) && !defined(CONFIG_CPU_MIPSR6) && \
++    !defined(CONFIG_EVA) && !defined(CONFIG_HAVE_PLAT_MEMCPY)
++#define PREF_USER_SRC
++#endif
+ #ifdef CONFIG_DMA_NONCOHERENT
+ #undef CONFIG_CPU_HAS_PREFETCH
+ #endif
+@@ -225,6 +235,11 @@
+ 			kernel_pref(hint, addr);			\
+ 		.endif;							\
+ 	.endif
++#elif defined(PREF_USER_SRC)
++# define _PREF(hint, addr, type)					\
++	.if (\prefsrc == 1) && (type == SRC_PREFETCH);			\
++		kernel_pref(hint, addr);				\
++	.endif
+ #else
+ # define _PREF(hint, addr, type)
+ #endif
+@@ -269,7 +284,7 @@
+ 	 * from : Source operand. USEROP or KERNELOP
+ 	 * to   : Destination operand. USEROP or KERNELOP
+ 	 */
+-	.macro __BUILD_COPY_USER mode, from, to
++	.macro __BUILD_COPY_USER mode, from, to, prefsrc=0
+ 
+ 	/* initialize __memcpy if this the first time we execute this macro */
+ 	.ifnotdef __memcpy
+@@ -343,6 +358,20 @@
+ 	STORE(t1, UNIT(-1)(dst), .Ls_exc_p1u\@)
+ 	PREFS(	0, 8*32(src) )
+ 	PREFD(	1, 8*32(dst) )
++#ifdef PREF_USER_SRC
++	.if \prefsrc == 2
++	/*
++	 * Kernel source: prefetch only lines wholly inside the source
++	 * (len is what is left from src), never into a neighbouring
++	 * buffer a device may still be writing.
++	 */
++	sltiu	t6, len, 9*32
++	bnez	t6, .Lpref_skip\@
++	 nop
++	pref	0, 8*32(src)
++.Lpref_skip\@:
++	.endif
++#endif
+ 	bne	len, rem, 1b
+ 	 nop
+ 
+@@ -670,6 +699,28 @@ EXPORT_SYMBOL(__raw_copy_to_user)
+ 	/* Legacy Mode, user <-> user */
+ 	__BUILD_COPY_USER LEGACY_MODE USEROP USEROP
+ 
++#ifdef PREF_USER_SRC
++/*
++ * copy_from_user with source prefetch, see PREF_USER_SRC
++ */
++	.align	5
++LEAF(__raw_copy_from_user_pref)
++EXPORT_SYMBOL(__raw_copy_from_user_pref)
++	__BUILD_COPY_USER LEGACY_MODE USEROP KERNELOP 1
++	END(__raw_copy_from_user_pref)
++
++/*
++ * copy_to_user with a bounded source prefetch: the source is kernel
++ * memory, often an skb a device just DMAed into, so prefetch only inside
++ * it. Uses t6, which the caller treats as clobbered.
++ */
++	.align	5
++LEAF(__raw_copy_to_user_pref)
++EXPORT_SYMBOL(__raw_copy_to_user_pref)
++	__BUILD_COPY_USER LEGACY_MODE KERNELOP USEROP 2
++	END(__raw_copy_to_user_pref)
++#endif
++
+ #endif
+ 
+ #ifdef CONFIG_EVA
