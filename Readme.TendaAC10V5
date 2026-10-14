@@ -1,0 +1,294 @@
+Tenda AC10 V5 (Siflower SF19A2890) on OpenWrt
+==============================================
+
+This tree adds support for the Tenda AC10 V5 to OpenWrt main, on Linux
+6.18 (the siflower target's kernel), with Ethernet, the MT7530 switch,
+the GMAC hardware NAT engine, CPU frequency scaling and both WiFi bands.
+
+
+Branches
+--------
+
+Two branches are provided. They are identical except for the WiFi
+commit ("sfwifi: add the SF19A2890 WiFi driver and firmware"), which
+builds the driver for one of the two known builds of the LMAC firmware:
+
+  review/sdkfw    LMAC firmware from Siflower's MIT-licensed 1806 SDK
+                  (the memory-optimised build). The firmware is MIT
+                  licensed and can be redistributed.
+
+  review/stockfw  LMAC firmware from the Tenda AC10 V5's original
+                  firmware. Faster on WiFi, most of all on receive
+                  (see Performance), but the firmware carries no
+                  licence.
+
+The two firmware builds number their messages differently and differ
+in the TX confirm layout (0x20 vs 0x1c bytes), the VI queue size (32 vs
+64) and the interface/station limits (8/32 vs 3/20), so a driver built
+for one cannot run the other. A mismatch is reported at probe as
+"unsupported LMAC firmware build".
+
+
+Commits
+-------
+
+  kernel: netfilter: fix two flowtable offload bugs
+  kernel: add kmod-dsa-mt7530
+  siflower: sf19a2890: support CPU frequency scaling
+  siflower: MIPS: prefetch in user copies and csum_partial
+  siflower: spi-nor: add S25FL064K lock support
+  siflower: dsa: add an 802.1Q-based tagger for MT7530
+  siflower: stmmac: add hardware NAT, speed up the data path
+  sfwifi: add the SF19A2890 WiFi driver and firmware
+  siflower: add support for Tenda AC10 V5
+  siflower: add Readme.TendaAC10V5
+
+Kernel changes are carried as OpenWrt patches (target/linux/generic/
+pending-6.18 and target/linux/siflower/patches-6.18) and driver sources
+(target/linux/siflower/files-6.18). The WiFi driver is an out-of-tree
+kernel package (package/kernel/sfwifi) built against the backports
+cfg80211. Each commit message describes its change in detail.
+
+
+Hardware
+--------
+
+  SoC       Siflower SF19A2890 (MIPS interAptiv, 2 cores x 2 threads),
+            run at up to 1.1 GHz
+  RAM       64 MiB
+  Flash     8 MiB SPI NOR (Winbond W25Q64)
+  Ethernet  MT7530 switch, 1x WAN + 3x LAN 10/100/1000
+  WiFi      built in: 2.4 GHz 2x2 802.11n, 5 GHz 2x2 802.11ac
+  UART      115200 8N1
+
+
+Build
+-----
+
+Host: a Linux machine with the OpenWrt build prerequisites, see
+https://openwrt.org/docs/guide-developer/toolchain/install-buildsystem
+
+  git clone -b review/sdkfw \
+      https://github.com/nsolanki-pro/openwrt-tendaAC10V5.git
+  cd openwrt-tendaAC10V5          # use -b review/stockfw for the other
+                                  # firmware build
+  ./scripts/feeds update -a
+  ./scripts/feeds install -a
+
+  cat > .config <<'CFG'
+  CONFIG_TARGET_siflower=y
+  CONFIG_TARGET_siflower_sf19a2890=y
+  CONFIG_TARGET_siflower_sf19a2890_DEVICE_tenda_ac10-v5=y
+  CFG
+  make defconfig
+  make -j$(nproc) download
+  make -j$(nproc)
+
+The same selection can be made in "make menuconfig" (Target System:
+Siflower, Subtarget: SF19A2890, Target Profile: Tenda AC10 V5). The
+board selection is all that is needed: the device profile pulls in
+every package the board needs. For the web interface, also add
+"CONFIG_PACKAGE_luci=y" to .config before "make defconfig".
+
+The first build also builds the host tools and the toolchain; later
+builds are incremental.
+
+
+What gets built
+---------------
+
+In bin/targets/siflower/sf19a2890/:
+
+  openwrt-siflower-sf19a2890-tenda_ac10-v5-squashfs-factory.bin
+      Kernel and root filesystem, checked against the 7488 KiB
+      firmware partition. Used for the first install from U-Boot.
+  openwrt-siflower-sf19a2890-tenda_ac10-v5-squashfs-sysupgrade.bin
+      The same image with sysupgrade metadata. Used for upgrades from
+      a running OpenWrt, including switching between the sdkfw and
+      stockfw builds.
+  openwrt-siflower-sf19a2890-tenda_ac10-v5-initramfs-kernel.bin
+      Kernel with the root filesystem in RAM. Not needed for
+      installation.
+  openwrt-siflower-sf19a2890-tenda_ac10-v5.manifest
+      The packages in the image, with versions.
+  packages/, sha256sums, profiles.json, *.buildinfo
+      The target's packages, checksums and build information.
+
+With LuCI selected, the factory and sysupgrade images are about
+7.06 MB (6.7 MiB) of the 7488 KiB (7.3 MiB) firmware partition; the
+rest becomes the writable overlay.
+
+Inside the image:
+- Kernel: Linux 6.18 (LZMA uImage with the devicetree appended). Built
+  in: GMAC with the hardware NAT engine, clocks, pinctrl, reset, DW APB
+  timer and cpufreq, SPI NOR, thermal.
+- Packages from the device profile: kmod-dsa-mt7530 (switch),
+  kmod-sfwifi (sf16a18_rf, startcore and sf16a18_fmac modules, with
+  the backports kmod-cfg80211 as a dependency), sfwifi-firmware (LMAC
+  firmware and RF configuration), zram-swap.
+- Target defaults: wpad-basic-mbedtls, firewall4 with kmod-nft-offload,
+  uboot-envtools, dropbear and the usual OpenWrt base system.
+- Board files: network and LED setup, the WiFi driver loader
+  (init.d/sfwifi) and watchdog, packet steering, sysctl tuning and
+  flow offloading on by default.
+
+Flash layout (8 MiB SPI NOR):
+
+  Offset     Size      Partition    Contents
+  0x000000   32 KiB    spl-loader   bootloader, kept
+  0x008000   412 KiB   u-boot       bootloader, kept
+  0x06f000   4 KiB     u-boot-env   U-Boot environment
+  0x070000   64 KiB    factory      MAC address and RF calibration, kept
+  0x080000   7488 KiB  firmware     OpenWrt: kernel, squashfs, overlay
+  0x7d0000   64 KiB    CFM          Tenda configuration, kept
+  0x7e0000   64 KiB    CFM_BACKUP   Tenda configuration, kept
+  0x7f0000   64 KiB    CFG          Tenda configuration, kept
+
+
+Install
+-------
+
+First install, from the U-Boot console over TFTP (serial 115200 8N1;
+stop autoboot with Ctrl+C):
+
+  tftpboot 0x81000000 openwrt-siflower-sf19a2890-tenda_ac10-v5-squashfs-factory.bin
+  sf probe 0
+  sf update 0x81000000 0x80000 ${filesize}
+  reset
+
+The stock web UI and the U-Boot web failsafe only accept signed Tenda
+images, so they cannot be used for the first install.
+
+Upgrades, from OpenWrt (keeps the configuration):
+
+  sysupgrade -v /tmp/openwrt-siflower-sf19a2890-tenda_ac10-v5-squashfs-sysupgrade.bin
+
+
+Performance
+-----------
+
+Three builds are compared, all on this board:
+
+  Vendor    the Tenda original firmware (Linux 4.14)
+  sdkfw     review/sdkfw on Linux 6.18 (SDK LMAC firmware)
+  stockfw   review/stockfw on Linux 6.18 (Tenda LMAC firmware)
+
+sdkfw and stockfw were measured back to back on 2026-10-14 with the
+same script, setup and configuration; each value is the range of two
+runs. The vendor firmware was measured earlier (wired 2026-10-03, WiFi
+2026-10-08) with the same iperf3 binary (3.20), server and AP. All
+values are in Mbit/s; "-" means not measured.
+
+Setup:
+
+                   upstream network (home gateway)
+                                 |
+                                 | 1 GbE (wan port, bridged)
+     +---------------------------+---------------------------+
+     | Server: TP-Link EX220 v2 running OpenWrt              |
+     | - iperf3 3.20 server                                  |
+     | - AP for the station tests: 5 GHz channel 36 VHT80,   |
+     |   2.4 GHz channel 9 HT40                              |
+     +---------------------------+----------------+----------+
+                                 | 1 GbE (lan2)   )))
+                                 |                )))  WiFi (test 3)
+                                 | WAN, DHCP      )))
+     +---------------------------+----------------+----------+
+     | Device under test: Tenda AC10 V5                      |
+     | - router mode: NAT, firewall, HW + SW flow offloading |
+     | - its own APs: 5 GHz channel 149 VHT80, 2.4 GHz       |
+     |   channel 1 HT20 (moved to 36 / 9 for test 3)         |
+     | - station interfaces added only for test 3            |
+     +---------------------------+---------------------------+
+                                 | 1 GbE (lan3)
+                                 | LAN, DHCP
+     +---------------------------+---------------------------+
+     | LAN client: Raspberry Pi 3B+ (USB 2.0 Gigabit         |
+     | Ethernet), iperf3 client                              |
+     +-------------------------------------------------------+
+
+  Test 1  router  --wan-->  server             (iperf3 on the router)
+  Test 2  client  --lan3--> router (NAT) --wan--> server
+  Test 3  router station  ~~WiFi~~>  server AP  (iperf3 on the router)
+
+- The LAN client's USB 2.0 Ethernet tops out at about 276 up / 319
+  down on its own, so the NAT results are capped by the client, not by
+  the router.
+- Hardware and software flow offloading are on (the default) and the
+  CPU runs at up to 1.1 GHz (schedutil). For test 2 the offload mode
+  is switched with the firewall's flow_offloading options.
+- The measured images also had the kernel profiler enabled (profile=4
+  on the command line, about 1.5 MB of RAM), which is not part of these
+  branches.
+
+1. Router-terminated traffic over the WAN port
+   (iperf3 on the router, 15 s runs; down = server to router)
+
+     Test                 Vendor        sdkfw         stockfw
+     TCP 1 flow, down     302           603-631       585-597
+     TCP 1 flow, up       329           424-429       377-399
+     TCP 4 flows, down    -             641-659       658-665
+     TCP 4 flows, up      -             588-593       569-594
+     UDP down             139           136-141       136-154
+     UDP up               154           70-179        193-194
+
+   UDP is offered at 600 Mbit/s with 1400-byte datagrams; the receiver
+   rate is shown. Loss on OpenWrt: down 0.1-1.2%, up 8-66% (the sender
+   outruns the path). The vendor values are averages of 5 (TCP) and 3
+   (UDP) runs; the vendor firmware cannot run iperf3 with several
+   flows.
+
+2. NAT forwarding, LAN client to WAN server
+   (4 TCP flows, 15 s runs; busy = busiest router CPU)
+
+     Mode                  Build     Up        Down      Busiest CPU
+     Hardware NAT (HNAT)   sdkfw     278       312-313   3-4%
+                           stockfw   278       313       3-5%
+     Software flowtable    sdkfw     276-277   294-304   51-62%
+                           stockfw   278       306-311   55-65%
+     No offload (CPU NAT)  sdkfw     179-187   221-249   76-78%
+                           stockfw   173-175   220-255   77-79%
+
+   All modes reach the LAN client's limit except CPU NAT. Hardware NAT
+   does it with the CPUs nearly idle. The vendor firmware's NAT
+   forwarding was not measured.
+
+3. WiFi, router as a station to the server AP
+   (one TCP flow, 10 s runs; TX = router to server)
+
+     Test            Vendor     sdkfw       stockfw
+     5 GHz TX        181        148-236     265
+     5 GHz RX        63         125-131     294-345
+     2.4 GHz TX      3.0-4.0    183-189     200-201
+     2.4 GHz RX      2.7-3.5    137-142     184
+
+   Link: 5 GHz VHT80 MCS7 2 streams (585 Mbit/s), 2.4 GHz HT40 MCS15
+   (270 Mbit/s). The vendor firmware was measured as a station on the
+   same AP (5 GHz on channel 36) with 15 s runs; on 2.4 GHz it
+   transmitted at 1 Mbit/s legacy rates.
+
+sdkfw compared with stockfw:
+- Wired results (tests 1 and 2) are the same within run-to-run noise:
+  they do not depend on the WiFi firmware build.
+- WiFi: the Tenda LMAC firmware build is faster in every test, most of
+  all on receive: 5 GHz RX 294-345 vs 125-131 (about 2.5x), 2.4 GHz RX
+  184 vs 137-142 (about 1.3x). It also needed far fewer TCP
+  retransmissions: 5 in all eight WiFi runs, against 107.
+
+Both OpenWrt builds are well ahead of the vendor firmware: about 2x on
+wired TCP download and 1.1-1.3x on upload, and far ahead as a WiFi
+station.
+
+
+Known limitations
+-----------------
+
+- The HNAT engine offloads IPv4 TCP/UDP with SNAT/masquerade and a
+  single WAN. Traffic to and from WiFi clients uses the software
+  flowtable.
+- The HNAT engine has no per-flow hit counters, so offloaded flows use a
+  300 s flowtable TCP timeout instead of hardware statistics.
+- The WiFi driver chain is loaded once per boot (init.d/sfwifi).
+  Unloading and reloading it wedges the LMAC firmware.
+- The core voltage is fixed. cpufreq only changes the CPU clock
+  divider.
