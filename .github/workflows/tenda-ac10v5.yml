@@ -2,6 +2,7 @@
 # the review branches or a tenda-ac10v5-* tag, and optionally publish
 # the images as a GitHub release of that tag.
 name: Build Tenda AC10 V5
+run-name: Build Tenda AC10 V5 from ${{ inputs.ref }}${{ inputs.release && ' (release)' || '' }}
 
 on:
   workflow_dispatch:
@@ -30,10 +31,12 @@ jobs:
     name: Build ${{ inputs.ref }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    # Prefixed names: generic ones leak into the build (RELEASE=true
+    # makes the host autoconf report its version as "true").
     env:
-      REF: ${{ inputs.ref }}
-      LUCI: ${{ inputs.luci }}
-      RELEASE: ${{ inputs.release }}
+      TENDA_REF: ${{ inputs.ref }}
+      TENDA_LUCI: ${{ inputs.luci }}
+      TENDA_RELEASE: ${{ inputs.release }}
     steps:
       - name: Free disk space
         run: |
@@ -59,18 +62,18 @@ jobs:
 
       - name: Check the ref
         run: |
-          if [ "$RELEASE" = true ] && ! git show-ref -q --verify "refs/tags/$REF"; then
-            echo "::error::A release needs a tag, '$REF' is not one"
+          if [ "$TENDA_RELEASE" = true ] && ! git show-ref -q --verify "refs/tags/$TENDA_REF"; then
+            echo "::error::A release needs a tag, '$TENDA_REF' is not one"
             exit 1
           fi
-          echo "NAME=$(echo "$REF" | tr '/' '-')" >> "$GITHUB_ENV"
+          echo "TENDA_NAME=$(echo "$TENDA_REF" | tr '/' '-')" >> "$GITHUB_ENV"
           git log -1 --format='Building %h %s'
 
       - name: Update and install feeds
         run: |
           ./scripts/feeds update -a
           # only what the image needs: LuCI and its dependencies
-          if [ "$LUCI" = true ]; then ./scripts/feeds install luci; fi
+          if [ "$TENDA_LUCI" = true ]; then ./scripts/feeds install luci; fi
 
       - name: Configure
         run: |
@@ -79,7 +82,7 @@ jobs:
           CONFIG_TARGET_siflower_sf19a2890=y
           CONFIG_TARGET_siflower_sf19a2890_DEVICE_tenda_ac10-v5=y
           CFG
-          if [ "$LUCI" = true ]; then echo CONFIG_PACKAGE_luci=y >> .config; fi
+          if [ "$TENDA_LUCI" = true ]; then echo CONFIG_PACKAGE_luci=y >> .config; fi
           make defconfig
           # the device profile must have pulled in the board's packages
           for p in kmod-dsa-mt7530 kmod-sfwifi sfwifi-firmware zram-swap; do
@@ -103,7 +106,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ env.NAME }}
+          name: logs-${{ env.TENDA_NAME }}
           path: logs/
 
       - name: Collect images
@@ -119,7 +122,7 @@ jobs:
       - name: Upload images
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-${{ env.NAME }}
+          name: openwrt-${{ env.TENDA_NAME }}
           path: out/
 
       - name: Publish release
@@ -127,7 +130,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          case "$REF" in
+          case "$TENDA_REF" in
           *stockfw*) fw="LMAC firmware from the Tenda AC10 V5's original firmware (review/stockfw)" ;;
           *sdkfw*)   fw="LMAC firmware from Siflower's MIT-licensed SDK (review/sdkfw)" ;;
           *)         fw="see Readme.TendaAC10V5" ;;
@@ -135,9 +138,9 @@ jobs:
           {
             echo "OpenWrt for the Tenda AC10 V5 (Siflower SF19A2890), Linux 6.18."
             echo
-            echo "- Tag: \`$REF\`, commit \`$(git rev-parse --short HEAD)\`"
+            echo "- Tag: \`$TENDA_REF\`, commit \`$(git rev-parse --short HEAD)\`"
             echo "- WiFi: $fw"
-            echo "- LuCI: $LUCI"
+            echo "- LuCI: $TENDA_LUCI"
             echo
             echo "First install: \`*-squashfs-factory.bin\` from the U-Boot console;"
             echo "upgrades: \`*-squashfs-sysupgrade.bin\` with sysupgrade."
@@ -147,5 +150,5 @@ jobs:
             cat out/sha256sums
             echo '```'
           } > notes.md
-          gh release create "$REF" out/* --verify-tag --prerelease \
-            --title "Tenda AC10 V5 $REF" --notes-file notes.md
+          gh release create "$TENDA_REF" out/* --verify-tag --prerelease \
+            --title "Tenda AC10 V5 $TENDA_REF" --notes-file notes.md
