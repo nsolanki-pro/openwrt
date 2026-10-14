@@ -1,0 +1,49 @@
+From 09cace01162c0350df42eb223f6983df46b34e39 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:11 +0530
+Subject: netfilter: nf_flow_table_offload: mark VLAN match keys as used
+
+nf_flow_rule_match() sets the dissector offsets for FLOW_DISSECTOR_KEY_VLAN
+and FLOW_DISSECTOR_KEY_CVLAN when a tuple carries 802.1Q encapsulation,
+but never adds them to dissector.used_keys, so flow_rule_match_key()
+reports them absent and a driver offloading a flow from a VLAN device
+cannot learn the ingress VID. Set the used_keys bits alongside the
+offsets.
+
+No in-tree TC_SETUP_FT user reads these keys yet: mtk_ppe only looks at
+FLOW_DISSECTOR_KEY_VLAN for bridged flows, which the flowtable does not
+create. The problem was found while writing flowtable offload support
+for the Siflower SF19A2890 packet engine, which matches on the ingress
+VID of flows from VLAN devices.
+
+Fixes: 3e1b0c168f6c ("netfilter: flowtable: add vlan match offload support")
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ net/netfilter/nf_flow_table_offload.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -124,6 +124,7 @@ static int nf_flow_rule_match(struct nf_
+ 		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 					tuple->encap[0].id,
+ 					tuple->encap[0].proto);
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 		vlan_encap = true;
+ 	}
+ 
+@@ -135,12 +136,14 @@ static int nf_flow_rule_match(struct nf_
+ 			nf_flow_rule_vlan_match(&key->cvlan, &mask->cvlan,
+ 						tuple->encap[1].id,
+ 						tuple->encap[1].proto);
++			match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN);
+ 		} else {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN,
+ 					  vlan);
+ 			nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 						tuple->encap[1].id,
+ 						tuple->encap[1].proto);
++			match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 		}
+ 	}
+ 
