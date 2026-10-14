@@ -69,7 +69,8 @@ jobs:
       - name: Update and install feeds
         run: |
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          # only what the image needs: LuCI and its dependencies
+          if [ "$LUCI" = true ]; then ./scripts/feeds install luci; fi
 
       - name: Configure
         run: |
@@ -89,7 +90,21 @@ jobs:
         run: make -j$(nproc) download
 
       - name: Build
-        run: make -j$(nproc) || make -j1 V=s
+        run: |
+          if ! make -j$(nproc) BUILD_LOG=1; then
+            # show the end of every package log that reports an error
+            for f in $(grep -rlE 'Error [0-9]|error:' logs | sort); do
+              echo "::group::$f"; tail -n 60 "$f"; echo "::endgroup::"
+            done
+            exit 1
+          fi
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ env.NAME }}
+          path: logs/
 
       - name: Collect images
         run: |
