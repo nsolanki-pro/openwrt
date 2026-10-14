@@ -8,6 +8,7 @@
  * Copyright (C) 2012 Chris Boot, Simon Arlott, Stephen Warren
  */
 
+#include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/device.h>
 #include <linux/err.h>

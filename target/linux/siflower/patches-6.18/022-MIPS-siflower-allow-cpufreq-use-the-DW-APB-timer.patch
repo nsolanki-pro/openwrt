@@ -1,0 +1,36 @@
+From 4ea6764da16866b27a6b739ff2cc33217d0164bb Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:10 +0530
+Subject: MIPS: siflower: allow cpufreq, use the DW APB timer
+
+The GIC timer and the CP0 counter both run off the CPU clock, so a CPU
+frequency change makes them useless for timekeeping. The SoC's DW APB
+timers run from the 100 MHz bus clock. Select DW_APB_TIMER_OF (it has
+no prompt), CPU_SUPPORTS_CPUFREQ and MIPS_EXTERNAL_TIMER so cpufreq can
+be enabled.
+
+With a DT that declares the timers, the APB timer is the clocksource
+and sched_clock; across ~500 frequency changes in 72 s the clock stays
+within 0.02% of an external reference.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ arch/mips/Kconfig | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -948,10 +948,13 @@ config MACH_SIFLOWER_MIPS
+ 	select COMMON_CLK
+ 	select CPU_MIPSR2_IRQ_EI
+ 	select CPU_MIPSR2_IRQ_VI
++	select CPU_SUPPORTS_CPUFREQ
+ 	select CSRC_R4K
++	select DW_APB_TIMER_OF
+ 	select DMA_NONCOHERENT
+ 	select IRQ_MIPS_CPU
+ 	select MIPS_CPU_SCACHE
++	select MIPS_EXTERNAL_TIMER
+ 	select MIPS_GIC
+ 	select MIPS_L1_CACHE_SHIFT_5
+ 	select NO_EXCEPT_FILL

@@ -142,7 +142,7 @@ static unsigned long sf19a28_pll_recalc_rate(struct clk_hw *hw,
 	u32 fbdiv = sf_pll_param_get(priv, PLL_FBDIV_HI, PLL_FBDIV_LO);
 	u32 postdiv1 = sf_pll_param_get(priv, PLL_POSTDIV1_HI, PLL_POSTDIV1_LO);
 	u32 postdiv2 = sf_pll_param_get(priv, PLL_POSTDIV2_HI, PLL_POSTDIV2_LO);
-	u32 pll_pd = sf_readl(cmn_priv, PLL_PD);
+	u32 pll_pd = sf_readl(cmn_priv, priv->offset + REG_PLL_PD);
 	u32 ref = parent_rate / refdiv;
 	u32 rate = ref * fbdiv;
 	u32 frac;
@@ -169,8 +169,125 @@ static u8 sf19a28_pll_get_parent(struct clk_hw *hw)
 	return (FIELD_GET(PLL_CFG_SRC, cfg) == 1);
 }
 
+/* VCO (ref / refdiv * fbdiv) limit given in the vendor clock guide */
+#define PLL_VCO_MAX		3200000000UL
+/* lock poll bound; runs before udelay is calibrated, so count reads */
+#define PLL_LOCK_POLLS		1000000
+/* muxdiv_cpu config (REG_MUXDIV_BASE + 0x100): bits 2:0 select its PLL */
+#define REG_CPU_MUXDIV_CFG	0x500
+#define  CPU_MUXDIV_SRC		GENMASK(2, 0)
+#define  CPU_MUXDIV_SRC_DDR	1
+
+/* lowest phase-detector input tried when picking REFDIV */
+#define PLL_REF_MIN		10000000UL
+#define PLL_REFDIV_MAX		8
+
+/*
+ * Pick REFDIV and FBDIV for @rate with POSTDIV1/2 kept: the closest
+ * integer-mode rate, the smallest REFDIV on a tie. REFDIV 1 only gives
+ * 40 MHz steps on the VCO (20 MHz on the CPU); REFDIV 2 halves that.
+ */
+static int sf19a28_pll_divs(struct sf19a2890_clk *priv, unsigned long rate,
+			    unsigned long parent_rate, u32 *refdiv, u32 *fbdiv)
+{
+	u32 postdiv1 = sf_pll_param_get(priv, PLL_POSTDIV1_HI, PLL_POSTDIV1_LO);
+	u32 postdiv2 = sf_pll_param_get(priv, PLL_POSTDIV2_HI, PLL_POSTDIV2_LO);
+	u64 vco = (u64)rate * postdiv1 * postdiv2, best_err = U64_MAX;
+	u32 rd;
+
+	if (!postdiv1 || !postdiv2)
+		return -EINVAL;
+	for (rd = 1; rd <= PLL_REFDIV_MAX && parent_rate / rd >= PLL_REF_MIN; rd++) {
+		unsigned long ref = parent_rate / rd;
+		u64 div = DIV_ROUND_CLOSEST_ULL(vco, ref);
+		u64 err;
+
+		if (!div || div > 0xfff || (u64)ref * div > PLL_VCO_MAX)
+			continue;
+		err = abs_diff((u64)ref * div, vco);
+		if (err < best_err) {
+			best_err = err;
+			*refdiv = rd;
+			*fbdiv = div;
+		}
+	}
+	return best_err == U64_MAX ? -EINVAL : 0;
+}
+
+static int sf19a28_pll_determine_rate(struct clk_hw *hw,
+				      struct clk_rate_request *req)
+{
+	struct sf19a2890_clk *priv = cmn_to_clk(hw_to_sf_clk_common(hw));
+	u32 postdiv1 = sf_pll_param_get(priv, PLL_POSTDIV1_HI, PLL_POSTDIV1_LO);
+	u32 postdiv2 = sf_pll_param_get(priv, PLL_POSTDIV2_HI, PLL_POSTDIV2_LO);
+	u32 refdiv, fbdiv;
+	int ret;
+
+	/* only the CPU PLL can be changed under a running system */
+	if (priv->offset != REG_PLL_BASE) {
+		req->rate = clk_hw_get_rate(hw);
+		return 0;
+	}
+	ret = sf19a28_pll_divs(priv, req->rate, req->best_parent_rate,
+			       &refdiv, &fbdiv);
+	if (ret)
+		return ret;
+	req->rate = req->best_parent_rate / refdiv * fbdiv / postdiv1 / postdiv2;
+	return 0;
+}
+
+/*
+ * REFDIV and the integer FBDIV are changed; POSTDIV stays as the
+ * bootloader set it. This is the vendor sequence (SDK
+ * sf_pll_set_rate): the PLL is reloaded while it runs, so the CPU is
+ * first moved to the DDR PLL and moved back once it relocks. Only the
+ * CPU PLL; the DDR and common PLLs feed memory and the buses.
+ */
+static int sf19a28_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+				unsigned long parent_rate)
+{
+	struct sf_clk_common *cmn = hw_to_sf_clk_common(hw);
+	struct sf19a2890_clk *priv = cmn_to_clk(cmn);
+	u32 refdiv, fbdiv, old_src;
+	unsigned long flags;
+	int i, ret;
+
+	if (priv->offset != REG_PLL_BASE)
+		return -EOPNOTSUPP;
+	ret = sf19a28_pll_divs(priv, rate, parent_rate, &refdiv, &fbdiv);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(cmn->lock, flags);
+	old_src = sf_readl(cmn, REG_CPU_MUXDIV_CFG);
+	sf_writel(cmn, REG_CPU_MUXDIV_CFG, (old_src & ~CPU_MUXDIV_SRC) |
+		  FIELD_PREP(CPU_MUXDIV_SRC, CPU_MUXDIV_SRC_DDR));
+	sf_rmw(cmn, priv->offset + REG_PLL_CFG, PLL_CFG_LOAD_DIVS, 0);
+	sf_writel(cmn, priv->offset + REG_PLL_PARAM(0), fbdiv & 0xff);
+	sf_rmw(cmn, priv->offset + REG_PLL_PARAM(1), 0xf, (fbdiv >> 8) & 0xf);
+	/* REFDIV = PARAM[47:42] = bits 7:2 of the sixth byte */
+	sf_rmw(cmn, priv->offset + REG_PLL_PARAM(5), 0xfc, refdiv << 2);
+	sf_rmw(cmn, priv->offset + REG_PLL_CFG, 0, PLL_CFG_LOAD_DIVS);
+	for (i = 0; i < PLL_LOCK_POLLS; i++)
+		if (sf_readl(cmn, priv->offset + REG_PLL_LOCK))
+			break;
+	/* never move the CPU onto an unlocked PLL; stay on the DDR PLL */
+	if (i < PLL_LOCK_POLLS)
+		sf_writel(cmn, REG_CPU_MUXDIV_CFG, old_src);
+	spin_unlock_irqrestore(cmn->lock, flags);
+
+	if (i == PLL_LOCK_POLLS) {
+		pr_err("pll_cpu: no lock at refdiv %u fbdiv %u, CPU left on pll_ddr\n",
+		       refdiv, fbdiv);
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
 static const struct clk_ops sf19a28_pll_ops = {
 	.recalc_rate = sf19a28_pll_recalc_rate,
+	.determine_rate = sf19a28_pll_determine_rate,
+	.set_rate = sf19a28_pll_set_rate,
 	.get_parent = sf19a28_pll_get_parent,
 };
 
@@ -209,13 +326,29 @@ static unsigned long sf19a28_muxdiv_recalc_rate(struct clk_hw *hw,
 	return parent_rate / div;
 }
 
+/*
+ * The CPU divider must never drop to 1: that would run the CPU at the raw
+ * PLL rate (twice the rated clock). cpufreq only ever changes this
+ * divider; the PLL itself is set once at boot (assigned-clock-rates).
+ */
+#define MUXDIV_CPU_OFFSET	0x100
+#define MUXDIV_CPU_MIN_DIV	2
+
+static unsigned int sf19a28_muxdiv_min_div(struct clk_hw *hw)
+{
+	struct sf19a2890_clk *priv = cmn_to_clk(hw_to_sf_clk_common(hw));
+
+	return priv->offset == REG_MUXDIV_BASE + MUXDIV_CPU_OFFSET ?
+	       MUXDIV_CPU_MIN_DIV : 1;
+}
+
 static int sf19a28_muxdiv_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
 {
 	unsigned int div;
 
 	div = DIV_ROUND_CLOSEST(req->best_parent_rate, req->rate);
-	if (!div)
-		div = 1;
+	if (div < sf19a28_muxdiv_min_div(hw))
+		div = sf19a28_muxdiv_min_div(hw);
 	else if (div > MUXDIV_RATIO_MAX + 1)
 		div = MUXDIV_RATIO_MAX + 1;
 
@@ -231,8 +364,8 @@ static int sf19a28_muxdiv_set_rate(struct clk_hw *hw, unsigned long rate,
 	unsigned int div;
 
 	div = DIV_ROUND_CLOSEST(parent_rate, rate);
-	if (div < 1)
-		div = 1;
+	if (div < sf19a28_muxdiv_min_div(hw))
+		div = sf19a28_muxdiv_min_div(hw);
 	else if (div > MUXDIV_RATIO_MAX + 1)
 		div = MUXDIV_RATIO_MAX + 1;
 	div -= 1;
@@ -321,7 +454,7 @@ static const struct clk_ops sf19a28_muxdiv_ops = {
 static SF19A28_MUXDIV(muxdiv_bus1, 0x0, CLK_IS_CRITICAL);
 static SF19A28_MUXDIV(muxdiv_bus2, 0x20, CLK_IS_CRITICAL);
 static SF19A28_MUXDIV(muxdiv_bus3, 0x40, CLK_IS_CRITICAL);
-static SF19A28_MUXDIV(muxdiv_cpu, 0x100, CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT);
+static SF19A28_MUXDIV(muxdiv_cpu, MUXDIV_CPU_OFFSET, CLK_SET_RATE_NO_REPARENT);
 static SF19A28_MUXDIV(muxdiv_pbus, 0x120, CLK_IS_CRITICAL);
 static SF19A28_MUXDIV(muxdiv_mem_phy, 0x140, CLK_IS_CRITICAL);
 static SF19A28_MUXDIV(muxdiv_uart, 0x180, 0);

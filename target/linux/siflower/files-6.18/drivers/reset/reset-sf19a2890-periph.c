@@ -5,7 +5,9 @@
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/of.h>
-#include <linux/platform_device.h>
+#include <linux/clk-provider.h>
+#include <linux/of_address.h>
+#include <linux/slab.h>
 #include <linux/reset-controller.h>
 #include <linux/spinlock.h>
 
@@ -68,15 +70,15 @@ const struct reset_control_ops reset_sf19a28_periph_ops = {
 	.status		= reset_sf19a28_periph_status,
 };
 
-static const struct of_device_id reset_sf19a28_periph_dt_ids[] = {
-	{ .compatible = "siflower,sf19a2890-periph-reset", },
-	{ /* sentinel */ },
-};
-
-static int reset_sf19a28_periph_probe(struct platform_device *pdev)
+/*
+ * Registered from of_clk_init() rather than as a platform driver: the
+ * DW APB timers are probed by timer_probe() right after of_clk_init(),
+ * long before platform drivers, and the bootloader leaves the timer
+ * block in reset. A late reset controller makes of_reset_control_get()
+ * fail there and the timer stays held in reset.
+ */
+static void __init reset_sf19a28_periph_of_init(struct device_node *node)
 {
-	struct device *dev = &pdev->dev;
-	struct device_node *node = dev->of_node;
 	struct reset_sf19a28_periph_data *data;
 	void __iomem *base;
 	int nr_resets;
@@ -87,19 +89,21 @@ static int reset_sf19a28_periph_probe(struct platform_device *pdev)
 
 	if (nr_resets < 1) {
 		ret = of_property_read_u32(node, "siflower,num-resets", &tmp);
-		if (ret < 0 || tmp < 1)
-			return -EINVAL;
+		if (ret < 0 || tmp < 1) {
+			pr_err("%pOF: no resets\n", node);
+			return;
+		}
 		nr_resets = tmp;
 	}
 
 	if (nr_resets >= 32) {
-		dev_err(dev, "too many resets.");
-		return -EINVAL;
+		pr_err("%pOF: too many resets\n", node);
+		return;
 	}
 
-	data = devm_kzalloc(dev, struct_size(data, reset_masks, nr_resets), GFP_KERNEL);
+	data = kzalloc(struct_size(data, reset_masks, nr_resets), GFP_KERNEL);
 	if (!data)
-		return -ENOMEM;
+		return;
 
 	ret = of_property_read_u32_array(node, "siflower,reset-masks",
 					 data->reset_masks, nr_resets);
@@ -107,25 +111,32 @@ static int reset_sf19a28_periph_probe(struct platform_device *pdev)
 		for (i = 0; i < nr_resets; i++)
 			data->reset_masks[i] = BIT(i);
 
-	base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
+	base = of_iomap(node, 0);
+	if (!base) {
+		pr_err("%pOF: cannot map registers\n", node);
+		goto err_free;
+	}
 
 	spin_lock_init(&data->lock);
 	data->base = base;
 	data->rcdev.owner = THIS_MODULE;
 	data->rcdev.nr_resets = nr_resets;
 	data->rcdev.ops = &reset_sf19a28_periph_ops;
-	data->rcdev.of_node = dev->of_node;
+	data->rcdev.of_node = node;
 
-	return devm_reset_controller_register(dev, &data->rcdev);
+	ret = reset_controller_register(&data->rcdev);
+	if (ret) {
+		pr_err("%pOF: register failed: %d\n", node, ret);
+		iounmap(base);
+		goto err_free;
+	}
+	/* no struct device will appear: let fw_devlink treat it as ready */
+	fwnode_dev_initialized(of_fwnode_handle(node), true);
+	return;
+
+err_free:
+	kfree(data);
 }
 
-static struct platform_driver reset_sf19a28_periph_driver = {
-	.probe	= reset_sf19a28_periph_probe,
-	.driver = {
-		.name		= "reset-sf19a2890-periph",
-		.of_match_table	= reset_sf19a28_periph_dt_ids,
-	},
-};
-builtin_platform_driver(reset_sf19a28_periph_driver);
+CLK_OF_DECLARE(sf19a2890_periph_reset, "siflower,sf19a2890-periph-reset",
+	       reset_sf19a28_periph_of_init);
