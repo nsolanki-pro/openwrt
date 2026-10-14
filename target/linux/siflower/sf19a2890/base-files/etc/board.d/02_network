@@ -12,6 +12,9 @@ siflower_setup_interfaces()
 		ucidef_add_switch "switch0" \
 			"0:wan" "1:lan" "2:lan" "3:lan" "4:lan" "6@eth0"
 		;;
+	tenda,ac10-v5)
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		;;
 	esac
 }
 
@@ -23,7 +26,8 @@ siflower_setup_macs()
 	local label_mac=""
 
 	case $board in
-	siflower,sf19a2890-evb)
+	siflower,sf19a2890-evb|\
+	tenda,ac10-v5)
 		wan_mac=$(macaddr_add "$(mtd_get_mac_binary factory 0x0)" 1)
 		;;
 	esac

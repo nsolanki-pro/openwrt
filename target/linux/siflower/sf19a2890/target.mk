@@ -10,3 +10,5 @@ KERNELNAME:=vmlinux
 define Target/Description
 	Build firmware images for Siflower SF19A2890 based boards.
 endef
+
+DEFAULT_PACKAGES += wpad-basic-mbedtls

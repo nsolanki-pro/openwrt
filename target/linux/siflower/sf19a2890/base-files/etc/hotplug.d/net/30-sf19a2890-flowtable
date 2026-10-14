@@ -1,0 +1,22 @@
+#!/bin/sh
+# fw4 fills the flow offload table's device list from the zone devices
+# present when it (re)loads. The WiFi driver loads after the firewall
+# (init.d/sfwifi), and a "wifi up" later on creates fresh netdevs, so
+# WiFi<->WAN flows would never use the fast path. Reload fw4 once the
+# new AP/STA netdev has had time to come up and join its bridge; the
+# lock collapses both bands' events into a single reload.
+
+[ "$ACTION" = add ] || exit 0
+case "$INTERFACE" in
+phy*-ap*|phy*-sta*) ;;
+*) exit 0 ;;
+esac
+
+/etc/init.d/firewall enabled || exit 0
+
+(
+	flock -n 9 || exit 0
+	sleep 10
+	logger -t firewall "Reloading firewall: flowtable devices after $INTERFACE"
+	fw4 -q reload
+) 9>/var/lock/sf19a2890-flowtable.lock &

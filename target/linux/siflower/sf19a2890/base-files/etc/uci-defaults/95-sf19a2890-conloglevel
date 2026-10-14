@@ -1,0 +1,9 @@
+#!/bin/sh
+# The console is a 115200 baud UART and printk writes to it
+# synchronously: anything chatty (driver warnings, stack dumps) stalls
+# the CPU that logs it. Keep warnings and worse on the console; the
+# kernel log (dmesg/logread) still has everything.
+uci -q get system.@system[0].conloglevel >/dev/null && exit 0
+uci set system.@system[0].conloglevel='5'
+uci commit system
+exit 0

@@ -1,0 +1,293 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+/dts-v1/;
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include "sf19a2890.dtsi"
+
+/ {
+	model = "Tenda AC10 V5";
+	compatible = "tenda,ac10-v5", "siflower,sf19a2890";
+
+	aliases {
+		led-boot = &led_sys;
+		led-failsafe = &led_sys;
+		led-running = &led_sys;
+		led-upgrade = &led_sys;
+		label-mac-device = &gmac;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x4000000>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_lan: lan {
+			function = LED_FUNCTION_LAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 0 GPIO_ACTIVE_LOW>;
+		};
+
+		led_sys: sys {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_BLUE>;
+			gpios = <&gpio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		led_wan: wan {
+			function = LED_FUNCTION_WAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
+		};
+
+		led_wlan: wlan {
+			function = LED_FUNCTION_WLAN;
+			color = <LED_COLOR_ID_BLUE>;
+			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			gpios = <&gpio 27 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+};
+
+/* CPU = pll_cpu / 2; the vendor SDK runs it up to 1.2 GHz at this voltage */
+&clk {
+	assigned-clocks = <&clk CLK_PLL_CPU>;
+	assigned-clock-rates = <2200000000>;
+};
+
+/* cpufreq only changes the CPU divider; the core voltage is fixed */
+/ {
+	cpu_opp_table: opp-table {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-1100000000 {
+			opp-hz = /bits/ 64 <1100000000>;
+			clock-latency-ns = <10000>;
+		};
+		opp-733333333 {
+			opp-hz = /bits/ 64 <733333333>;
+			clock-latency-ns = <10000>;
+		};
+		opp-550000000 {
+			opp-hz = /bits/ 64 <550000000>;
+			clock-latency-ns = <10000>;
+		};
+		opp-440000000 {
+			opp-hz = /bits/ 64 <440000000>;
+			clock-latency-ns = <10000>;
+		};
+		opp-366666666 {
+			opp-hz = /bits/ 64 <366666666>;
+			clock-latency-ns = <10000>;
+		};
+	};
+};
+
+&cpu0 {
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu1 {
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu2 {
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu3 {
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&gmac {
+	status = "okay";
+	siflower,hnat;
+	phy-mode = "rgmii-id";
+	snps,ps-speed = <1000>;
+	nvmem-cells = <&macaddr_factory_0>, <&rgmii_delay_factory_b2>;
+	nvmem-cell-names = "mac-address", "rgmii-delay";
+	/* the MAC does not report its FIFO size, which DSA's MTU needs */
+	tx-fifo-depth = <4096>;
+
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+		pause;
+	};
+};
+
+&mdio {
+	switch: switch@1f {
+		compatible = "mediatek,mt7530";
+		reg = <0x1f>;
+		reset-gpios = <&gpio 11 GPIO_ACTIVE_HIGH>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+				label = "lan1";
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "lan2";
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "lan3";
+			};
+
+			port@4 {
+				reg = <4>;
+				label = "wan";
+			};
+
+			port@5 {
+				reg = <5>;
+				ethernet = <&gmac>;
+				phy-mode = "rgmii";
+				/* the GMAC's HNAT engine parses 802.1Q tags only */
+				dsa-tag-protocol = "mtk-8021q";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+					pause;
+				};
+			};
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&usb {
+	status = "okay";
+};
+
+&usb_phy {
+	status = "okay";
+};
+
+&spi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <30000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "spl-loader";
+				reg = <0x00000000 0x00008000>; /* 32k */
+				read-only;
+			};
+
+			partition@8000 {
+				label = "u-boot";
+				reg = <0x00008000 0x00067000>; /* 412k */
+			};
+
+			partition@6f000 {
+				label = "u-boot-env";
+				reg = <0x0006f000 0x00001000>; /* 4k */
+			};
+
+			factory: partition@70000 {
+				label = "factory";
+				reg = <0x00070000 0x00010000>; /* 64k */
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_factory_0: macaddr@0 {
+						reg = <0x0 0x6>;
+					};
+
+					rgmii_delay_factory_b2: rgmii-delay@b2 {
+						reg = <0xb2 0x4>;
+					};
+				};
+			};
+
+			firmware@80000 {
+				compatible = "denx,uimage";
+				label = "firmware";
+				reg = <0x00080000 0x000750000>; /* 7.25MB */
+			};
+
+			partition@7d0000 {
+				label = "CFM";
+				reg = <0x007d0000 0x00010000>; /* 64k */
+			};
+
+			partition@7e0000 {
+				label = "CFM_BACKUP";
+				reg = <0x007e0000 0x00010000>; /* 64k */
+			};
+
+			partition@7f0000 {
+				label = "CFG";
+				reg = <0x007f0000 0x00010000>; /* 64k */
+			};
+		};
+	};
+};
+
+/* External PA/FEM on the 5 GHz band, dual-antenna calibration, RF
+ * calibration data in the factory partition.
+ */
+&wlan_rf {
+	status = "okay";
+	force_expa = <1>;
+	siflower,hb-ext-pa;
+	dual-antenna-calibrate = <1>;
+	mtd-rf-cali-config = <&factory 2048>;
+};
+
+&wlan_lb {
+	status = "okay";
+	/* the driver derives the radio MAC as base + 2 (vendor layout) */
+	nvmem-cells = <&macaddr_factory_0>;
+	nvmem-cell-names = "mac-address";
+	smp-affinity = <2>;
+};
+
+&wlan_hb {
+	status = "okay";
+	smp-affinity = <3>;
+	/* the driver derives the radio MAC as base + 6 (vendor layout) */
+	nvmem-cells = <&macaddr_factory_0>;
+	nvmem-cell-names = "mac-address";
+};

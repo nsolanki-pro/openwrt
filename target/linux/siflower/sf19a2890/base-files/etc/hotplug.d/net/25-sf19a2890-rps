@@ -1,0 +1,19 @@
+#!/bin/sh
+# packet_steering only reruns on netifd interface events. The WiFi
+# netdevs appear after those (init.d/sfwifi, "wifi up"), so their RPS
+# masks stayed 0. Reapply the platform layout when a netdev it covers
+# is added; the lock collapses a burst of adds into one run.
+
+[ "$ACTION" = add ] || exit 0
+case "$INTERFACE" in
+phy*-ap*|phy*-sta*|wan|lan*) ;;
+*) exit 0 ;;
+esac
+
+[ -x /usr/libexec/platform/packet-steering.sh ] || exit 0
+
+(
+	flock -n 9 || exit 0
+	sleep 2
+	/usr/libexec/platform/packet-steering.sh
+) 9>/var/lock/sf19a2890-rps.lock &

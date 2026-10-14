@@ -1,0 +1,51 @@
+#!/bin/sh /etc/rc.common
+# Load the vendor sf_smac WiFi driver chain (kmod-sfwifi ships no
+# AUTOLOAD, see target/linux/siflower/modules.mk):
+#   cfg80211 -> sf16a18_rf -> startcore -> sf16a18_fmac
+#
+# - Once per boot only: unloading and reloading the chain wedges the
+#   LMAC ("wait lmac init"), and the next reboot then hangs too.
+# - Memory is compacted before sf16a18_fmac: its probe allocates large
+#   per-band DMA pools on a board with ~52MB usable RAM. One retry after
+#   another compaction covers a fragmented boot.
+# - Backgrounded after a short delay so the busy first seconds of boot
+#   (fw4, netifd, dnsmasq, overlay mount) don't overlap the probe.
+# - On first boot the wireless config doesn't exist yet (no phy when
+#   uci-defaults ran): generate it, then let netifd pick up the radios.
+
+START=45
+
+load_wifi() {
+	local m
+
+	grep -q '^sf16a18_fmac ' /proc/modules && return 0
+
+	# modprobe: the backports cfg80211 needs compat loaded first
+	for m in cfg80211 sf16a18_rf startcore; do
+		modprobe "$m" || { logger -t sfwifi "modprobe $m failed"; return 1; }
+	done
+
+	echo 1 > /proc/sys/vm/compact_memory
+	if ! insmod sf16a18_fmac; then
+		sleep 2
+		echo 1 > /proc/sys/vm/compact_memory
+		insmod sf16a18_fmac || {
+			logger -t sfwifi "insmod sf16a18_fmac failed"
+			return 1
+		}
+	fi
+}
+
+boot() {
+	(
+		sleep 20
+		load_wifi || exit 1
+		# give the fmac probe time to register both wiphys
+		sleep 5
+		if ! uci -q show wireless | grep -q '=wifi-device'; then
+			wifi config
+		fi
+		ubus call network reload
+		wifi up
+	) &
+}
