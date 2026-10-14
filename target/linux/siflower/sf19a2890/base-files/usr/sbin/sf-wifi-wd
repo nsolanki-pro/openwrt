@@ -1,0 +1,121 @@
+#!/bin/sh
+# WiFi liveness watchdog for the SF19A2890 (sf_smac). Mirrors the stock
+# Tenda netctrl monitor: an AP that keeps beaconing while its management
+# path has stalled is detected from the driver's trx_stats counters and
+# the radio is rebuilt with "wifi down/up" (hostapd/netifd only).
+#
+# Never reloads the driver: unloading sf16a18_fmac wedges the LMAC.
+#
+# A poll is "bad" when the band saw management activity but no answer:
+#   >= 3 wildcard probe requests and no probe response queued, or
+#   >= 1 auth request and no auth reply queued, or
+#   >= 3 management frames queued and none confirmed by the LMAC.
+# FAILS consecutive bad polls trigger a rebuild; at most MAX_ACTIONS per
+# band per hour, then it only logs. Idle networks can't trip it.
+
+POLL=30
+FAILS=3
+BOOT_GRACE=180
+ACTION_GRACE=120
+MAX_ACTIONS=3
+STATE=/var/run/sf-wifi-wd
+
+log() { logger -t sf-wifi-wd -p "daemon.$1" "$2"; }
+
+# radio section whose path matches the phy's platform device
+phy_radio() {
+	local dev r
+	dev=$(basename "$(readlink -f /sys/class/ieee80211/$1/device)")
+	for r in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		case "$(uci -q get wireless.$r.path)" in
+		*"$dev") echo "$r"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# sum of the counters over the phy's AP interfaces that hostapd runs
+# (trx_stats is produced on the first read only: take it in one read):
+# skipped while hostapd reports them not ENABLED (DFS CAC, starting up),
+# included when hostapd's object exists but doesn't answer (hung)
+read_counters() {
+	local ifs="" i st
+	for i in $(ls /sys/class/ieee80211/$1/device/net 2>/dev/null); do
+		case "$i" in *-ap*) ;; *) continue ;; esac
+		ubus list hostapd.$i >/dev/null 2>&1 || continue
+		if st=$(ubus -t 5 call hostapd.$i get_status 2>/dev/null); then
+			echo "$st" | grep -q '"status": "ENABLED"' || continue
+		fi
+		ifs="$ifs $i"
+	done
+	[ -n "$ifs" ] || return 1
+	awk -v ifs="$ifs" '
+		/^VIF\[/ { n = split(ifs, a, " "); on = 0
+			   for (k = 1; k <= n; k++) if ($2 == a[k]) on = 1; next }
+		on && /^  mgmt-tx:/   { q += $2 }
+		on && /^  [a-z_]+:[0-9]+$/ { split($1, f, ":"); c[f[1]] += f[2] }
+		END { printf "%d %d %d %d %d %d\n", c["preb_req_wild"], c["preb_resp"],
+			  c["rx_auth"], c["auth_reply"], q, c["mgmt_cfm"] }
+	' <<-EOF
+	$(dd if=/sys/kernel/debug/ieee80211/$1/siwifi/trx_stats bs=16k 2>/dev/null)
+	EOF
+}
+
+sleep $BOOT_GRACE
+
+while :; do
+	mkdir -p $STATE
+	now=$(cut -d. -f1 /proc/uptime)
+	for d in /sys/kernel/debug/ieee80211/phy*/siwifi; do
+		[ -r "$d/trx_stats" ] || continue
+		phy=${d%/siwifi}; phy=${phy##*/}
+		s=$STATE/$phy
+
+		cur=$(read_counters $phy) || { rm -f $s.prev; continue; }
+		[ -f $s.grace ] && [ "$now" -lt "$(cat $s.grace)" ] && {
+			echo "$cur" > $s.prev; continue; }
+		prev=$(cat $s.prev 2>/dev/null); echo "$cur" > $s.prev
+		[ -n "$prev" ] || continue
+
+		set -- $prev $cur
+		wild=$(($7 - $1)); resp=$(($8 - $2)); auth=$(($9 - $3))
+		authr=$((${10} - $4)); q=$((${11} - $5)); cfm=$((${12} - $6))
+		# counters restart from zero when a VIF is recreated
+		[ $wild -lt 0 -o $q -lt 0 -o $cfm -lt 0 ] && continue
+
+		# hidden SSIDs legitimately ignore wildcard probes
+		uci -q show wireless | grep -q "\.hidden='1'" && wild=0
+
+		# bad: activity without answers; good: activity that got
+		# answered; anything else (no activity) leaves the count alone,
+		# so bursty probe traffic neither proves nor clears a stall
+		fail=$(cat $s.fail 2>/dev/null || echo 0)
+		if [ $wild -ge 3 -a $resp -eq 0 ] ||
+		   [ $auth -ge 1 -a $authr -eq 0 ] ||
+		   [ $q -ge 3 -a $cfm -eq 0 ]; then
+			fail=$((fail + 1))
+			log warning "$phy stalled ($fail/$FAILS): probes $wild/resp $resp auth $auth/reply $authr mgmt queued $q/confirmed $cfm"
+		elif [ $resp -gt 0 -o $authr -gt 0 -o $cfm -gt 0 ]; then
+			fail=0
+		fi
+		echo $fail > $s.fail
+		[ $fail -ge $FAILS ] || continue
+
+		echo 0 > $s.fail
+		echo $((now + ACTION_GRACE)) > $s.grace
+		# rate limit: action timestamps within the last hour
+		awk -v t=$now '$1 > t - 3600' $s.actions 2>/dev/null > $s.tmp
+		mv $s.tmp $s.actions
+		if [ "$(wc -l < $s.actions)" -ge $MAX_ACTIONS ]; then
+			log crit "$phy still stalled, $MAX_ACTIONS recoveries in the last hour: giving up for now"
+			continue
+		fi
+		echo $now >> $s.actions
+		radio=$(phy_radio $phy) || { log err "$phy: no wireless section"; continue; }
+		log crit "$phy stalled: restarting $radio"
+		wifi down $radio
+		sleep 3
+		wifi up $radio
+	done
+	sleep $POLL
+done
