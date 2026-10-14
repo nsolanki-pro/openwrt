@@ -1,0 +1,403 @@
+From 99f8cda2b090a25d58320605c46759a43f0fe123 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:12 +0530
+Subject: net: dsa: mt7530: support the mtk-8021q tagger
+
+Implement change_tag_protocol and the tag_8021q VLAN callbacks so an
+MT7530 can run with 802.1Q tags on its CPU port, selected with
+dsa-tag-protocol = "mtk-8021q" or at runtime through the conduit's
+dsa/tagging attribute.
+
+In this mode every user port and the CPU port forward by VLAN table
+(security mode). Each tag_8021q VLAN is its user port's PVID, egress-
+untagged there and egress-tagged towards the CPU; bridge join/leave go
+through dsa_tag_8021q_bridge_join/leave. Only VLAN-unaware bridging is
+supported: VLAN filtering is refused and bridge VLAN ops are no-ops.
+
+Unlike MTK-tagged frames, which carry an explicit destination bitmap,
+802.1Q frames from the CPU are subject to the CPU port's own setup, so:
+- PVC[31:16] holds the TPID (0x8100) the port matches tags against;
+  the MTK-tag setup leaves it 0 and every CPU frame was dropped
+- the CPU port's cached port matrix (ports[].pm) is kept at all user
+  ports: port_enable() rewrites the matrix from it, and the MTK-tag
+  setup never fills it in for the CPU port (matrix 0, all dropped)
+- the CPU port forwards in FID_BRIDGED's STP state
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ drivers/net/dsa/Kconfig  |   1 +
+ drivers/net/dsa/mt7530.c | 266 ++++++++++++++++++++++++++++++++++++++-
+ drivers/net/dsa/mt7530.h |   3 +
+ 3 files changed, 264 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/dsa/Kconfig
++++ b/drivers/net/dsa/Kconfig
+@@ -31,6 +31,7 @@ source "drivers/net/dsa/lantiq/Kconfig"
+ config NET_DSA_MT7530
+ 	tristate "MediaTek MT7530 and MT7531 Ethernet switch support"
+ 	select NET_DSA_TAG_MTK
++	select NET_DSA_TAG_MTK_8021Q
+ 	select REGMAP_IRQ
+ 	imply NET_DSA_MT7530_MDIO
+ 	imply NET_DSA_MT7530_MMIO
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -5,6 +5,7 @@
+  */
+ #include <linux/etherdevice.h>
+ #include <linux/if_bridge.h>
++#include <linux/dsa/8021q.h>
+ #include <linux/iopoll.h>
+ #include <linux/mdio.h>
+ #include <linux/mfd/syscon.h>
+@@ -1542,13 +1543,26 @@ mt7530_port_bridge_join(struct dsa_switc
+ {
+ 	struct mt7530_priv *priv = ds->priv;
+ 
++	if (priv->tag_8021q) {
++		int err;
++
++		/* swap the port's standalone tag_8021q VLAN for the bridge's */
++		err = dsa_tag_8021q_bridge_join(ds, port, bridge, tx_fwd_offload,
++						extack);
++		if (err)
++			return err;
++	}
++
+ 	mutex_lock(&priv->reg_mutex);
+ 
+ 	mt7530_update_port_member(priv, port, bridge.dev, true);
+ 
+-	/* Set to fallback mode for independent VLAN learning */
+-	mt7530_rmw(priv, MT7530_PCR_P(port), PCR_PORT_VLAN_MASK,
+-		   MT7530_PORT_FALLBACK_MODE);
++	/* Set to fallback mode for independent VLAN learning; with mtk-8021q
++	 * the port stays in security mode, forwarding by its tag_8021q VLAN
++	 */
++	if (!priv->tag_8021q)
++		mt7530_rmw(priv, MT7530_PCR_P(port), PCR_PORT_VLAN_MASK,
++			   MT7530_PORT_FALLBACK_MODE);
+ 
+ 	mutex_unlock(&priv->reg_mutex);
+ 
+@@ -1647,16 +1661,20 @@ mt7530_port_bridge_leave(struct dsa_swit
+ {
+ 	struct mt7530_priv *priv = ds->priv;
+ 
++	if (priv->tag_8021q)
++		dsa_tag_8021q_bridge_leave(ds, port, bridge);
++
+ 	mutex_lock(&priv->reg_mutex);
+ 
+ 	mt7530_update_port_member(priv, port, bridge.dev, false);
+ 
+ 	/* When a port is removed from the bridge, the port would be set up
+ 	 * back to the default as is at initial boot which is a VLAN-unaware
+-	 * port.
++	 * port. With mtk-8021q it stays in security mode.
+ 	 */
+-	mt7530_rmw(priv, MT7530_PCR_P(port), PCR_PORT_VLAN_MASK,
+-		   MT7530_PORT_MATRIX_MODE);
++	if (!priv->tag_8021q)
++		mt7530_rmw(priv, MT7530_PCR_P(port), PCR_PORT_VLAN_MASK,
++			   MT7530_PORT_MATRIX_MODE);
+ 
+ 	mutex_unlock(&priv->reg_mutex);
+ }
+@@ -1818,6 +1836,17 @@ mt7530_port_vlan_filtering(struct dsa_sw
+ {
+ 	struct dsa_port *dp = dsa_to_port(ds, port);
+ 	struct dsa_port *cpu_dp = dp->cpu_dp;
++	struct mt7530_priv *priv = ds->priv;
++
++	if (priv->tag_8021q) {
++		if (vlan_filtering) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "VLAN filtering is not supported with the mtk-8021q tagger");
++			return -EOPNOTSUPP;
++		}
++		/* the port keeps its tag_8021q VLAN configuration */
++		return 0;
++	}
+ 
+ 	if (vlan_filtering) {
+ 		/* The port is being kept as VLAN-unaware port when bridge is
+@@ -1941,6 +1970,12 @@ mt7530_port_vlan_add(struct dsa_switch *
+ 	struct mt7530_hw_vlan_entry new_entry;
+ 	struct mt7530_priv *priv = ds->priv;
+ 
++	/* With mtk-8021q only VLAN-unaware bridging is supported, where
++	 * forwarding uses the tag_8021q VLANs; leave the PVIDs alone.
++	 */
++	if (priv->tag_8021q)
++		return 0;
++
+ 	mutex_lock(&priv->reg_mutex);
+ 
+ 	mt7530_hw_vlan_entry_init(&new_entry, port, untagged);
+@@ -1983,6 +2018,9 @@ mt7530_port_vlan_del(struct dsa_switch *
+ 	struct mt7530_hw_vlan_entry target_entry;
+ 	struct mt7530_priv *priv = ds->priv;
+ 
++	if (priv->tag_8021q)
++		return 0;
++
+ 	mutex_lock(&priv->reg_mutex);
+ 
+ 	mt7530_hw_vlan_entry_init(&target_entry, port, 0);
+@@ -2078,6 +2116,219 @@ mtk_get_tag_protocol(struct dsa_switch *
+ 	return DSA_TAG_PROTO_MTK;
+ }
+ 
++/*
++ * mtk-8021q: the CPU port carries 802.1Q tags instead of the MediaTek
++ * special tag, using tag_8021q's VLANs: every user port and the CPU port
++ * forward by VLAN table (security mode); each tag_8021q VLAN is the PVID
++ * of its user port, egress-untagged there and egress-tagged towards the
++ * CPU. Lets a MAC-side engine that only understands 802.1Q (the
++ * SF19A2890 GMAC's NAT offload) parse the frames. VLAN-unaware bridging
++ * only.
++ */
++static int mt7530_tag_8021q_vlan_add(struct dsa_switch *ds, int port, u16 vid,
++				     u16 flags)
++{
++	bool untagged = flags & BRIDGE_VLAN_INFO_UNTAGGED;
++	struct mt7530_priv *priv = ds->priv;
++	u32 val, members;
++	int ret;
++
++	mutex_lock(&priv->reg_mutex);
++
++	ret = mt7530_vlan_cmd(priv, MT7530_VTCR_RD_VID, vid);
++	if (ret)
++		goto out;
++
++	val = mt7530_read(priv, MT7530_VAWD1);
++	members = ((val & VLAN_VALID) ? (val >> PORT_MEM_SHFT) & PORT_MEM_MASK : 0) |
++		  BIT(port);
++	if (!(val & VLAN_VALID))
++		mt7530_write(priv, MT7530_VAWD2, 0);
++	mt7530_write(priv, MT7530_VAWD1, IVL_MAC | VTAG_EN | PORT_MEM(members) |
++		     FID(FID_BRIDGED) | VLAN_VALID);
++	mt7530_rmw(priv, MT7530_VAWD2, ETAG_CTRL_P_MASK(port),
++		   ETAG_CTRL_P(port, untagged ? MT7530_VLAN_EGRESS_UNTAG :
++						MT7530_VLAN_EGRESS_TAG));
++
++	ret = mt7530_vlan_cmd(priv, MT7530_VTCR_WR_VID, vid);
++	if (ret)
++		goto out;
++
++	if (flags & BRIDGE_VLAN_INFO_PVID) {
++		priv->ports[port].pvid_8021q = vid;
++		mt7530_rmw(priv, MT7530_PPBV1_P(port), G0_PORT_VID_MASK,
++			   G0_PORT_VID(vid));
++	}
++out:
++	mutex_unlock(&priv->reg_mutex);
++	return ret;
++}
++
++static int mt7530_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
++{
++	struct mt7530_priv *priv = ds->priv;
++	u32 val, members;
++	int ret;
++
++	mutex_lock(&priv->reg_mutex);
++
++	ret = mt7530_vlan_cmd(priv, MT7530_VTCR_RD_VID, vid);
++	if (ret)
++		goto out;
++
++	val = mt7530_read(priv, MT7530_VAWD1);
++	members = (val & VLAN_VALID) ?
++		  ((val >> PORT_MEM_SHFT) & PORT_MEM_MASK) & ~BIT(port) : 0;
++	if (members) {
++		mt7530_write(priv, MT7530_VAWD1, IVL_MAC | VTAG_EN |
++			     PORT_MEM(members) | FID(FID_BRIDGED) | VLAN_VALID);
++	} else {
++		mt7530_write(priv, MT7530_VAWD1, 0);
++		mt7530_write(priv, MT7530_VAWD2, 0);
++	}
++	ret = mt7530_vlan_cmd(priv, MT7530_VTCR_WR_VID, vid);
++
++	if (priv->ports[port].pvid_8021q == vid) {
++		priv->ports[port].pvid_8021q = 0;
++		mt7530_rmw(priv, MT7530_PPBV1_P(port), G0_PORT_VID_MASK,
++			   G0_PORT_VID_DEF);
++	}
++out:
++	mutex_unlock(&priv->reg_mutex);
++	return ret;
++}
++
++static void mt7530_set_8021q_port_mode(struct mt7530_priv *priv, bool on)
++	__must_hold(&priv->reg_mutex)
++{
++	struct dsa_switch *ds = priv->ds;
++	struct dsa_port *dp;
++
++	dsa_switch_for_each_cpu_port(dp, ds) {
++		/* mt7530_port_enable() rewrites a port's matrix from the
++		 * cached pm, which the MTK-tag setup never fills in for the
++		 * CPU port (its frames carry an explicit port bitmap). With
++		 * 802.1Q the CPU port forwards by matrix + VLAN table, so
++		 * keep it connected to every user port.
++		 */
++		priv->ports[dp->index].pm = on ?
++			PCR_MATRIX(dsa_user_ports(ds)) : 0;
++		mt7530_rmw(priv, MT7530_PCR_P(dp->index), PCR_MATRIX_MASK,
++			   PCR_MATRIX(dsa_user_ports(ds)));
++
++		/* PVC[31:16] is the TPID the port matches 802.1Q tags
++		 * against; the MTK-tag setup leaves it 0, which makes the
++		 * port drop every tagged frame from the CPU (RxFiltering)
++		 */
++		if (on)
++			mt7530_write(priv, MT7530_PVC_P(dp->index),
++				     MT7530_PVC_TPID(ETH_P_8021Q) |
++				     VLAN_ATTR(MT7530_VLAN_USER) |
++				     PVC_EG_TAG(MT7530_VLAN_EG_DISABLED));
++		else
++			mt7530_write(priv, MT7530_PVC_P(dp->index),
++				     PORT_SPEC_TAG |
++				     PVC_EG_TAG(MT7530_VLAN_EG_CONSISTENT));
++		mt7530_rmw(priv, MT7530_PCR_P(dp->index), PCR_PORT_VLAN_MASK,
++			   on ? MT7530_PORT_SECURITY_MODE :
++				MT7530_PORT_FALLBACK_MODE);
++		/* DSA never sets an STP state on the CPU port: with the MTK
++		 * tag its frames carry a port bitmap and bypass the VLAN/STP
++		 * lookup, with 802.1Q they don't. Forward in the FID the
++		 * tag_8021q VLANs use.
++		 */
++		if (on)
++			mt7530_rmw(priv, MT7530_SSP_P(dp->index),
++				   FID_PST_MASK(FID_BRIDGED),
++				   FID_PST(FID_BRIDGED, MT7530_STP_FORWARDING));
++	}
++
++	dsa_switch_for_each_user_port(dp, ds) {
++		if (on) {
++			mt7530_rmw(priv, MT7530_PCR_P(dp->index),
++				   PCR_PORT_VLAN_MASK, MT7530_PORT_SECURITY_MODE);
++			mt7530_rmw(priv, MT7530_PVC_P(dp->index),
++				   VLAN_ATTR_MASK | PVC_EG_TAG_MASK | ACC_FRM_MASK,
++				   VLAN_ATTR(MT7530_VLAN_USER) |
++				   PVC_EG_TAG(MT7530_VLAN_EG_DISABLED) |
++				   MT7530_VLAN_ACC_ALL);
++		} else {
++			mt7530_rmw(priv, MT7530_PCR_P(dp->index),
++				   PCR_PORT_VLAN_MASK,
++				   dsa_port_bridge_dev_get(dp) ?
++				   MT7530_PORT_FALLBACK_MODE :
++				   MT7530_PORT_MATRIX_MODE);
++			mt7530_rmw(priv, MT7530_PVC_P(dp->index),
++				   VLAN_ATTR_MASK | PVC_EG_TAG_MASK | ACC_FRM_MASK,
++				   VLAN_ATTR(MT7530_VLAN_TRANSPARENT) |
++				   PVC_EG_TAG(MT7530_VLAN_EG_CONSISTENT) |
++				   MT7530_VLAN_ACC_ALL);
++			mt7530_rmw(priv, MT7530_PPBV1_P(dp->index),
++				   G0_PORT_VID_MASK, G0_PORT_VID_DEF);
++		}
++	}
++}
++
++static int mt7530_change_tag_protocol(struct dsa_switch *ds,
++				      enum dsa_tag_protocol proto)
++{
++	struct mt7530_priv *priv = ds->priv;
++	bool want_8021q;
++	struct dsa_port *dp;
++	int err;
++
++	switch (proto) {
++	case DSA_TAG_PROTO_MTK:
++		want_8021q = false;
++		break;
++	case DSA_TAG_PROTO_MTK_8021Q:
++		/* only brought up on the MT7530 */
++		if (priv->id != ID_MT7530 && priv->id != ID_MT7621)
++			return -EPROTONOSUPPORT;
++		want_8021q = true;
++		break;
++	default:
++		return -EPROTONOSUPPORT;
++	}
++
++	if (want_8021q == priv->tag_8021q)
++		return 0;
++
++	/* tag_8021q VLANs are only installed at setup and bridge join */
++	dsa_switch_for_each_user_port(dp, ds)
++		if (dsa_port_bridge_dev_get(dp))
++			return -EBUSY;
++
++	if (want_8021q) {
++		mutex_lock(&priv->reg_mutex);
++		mt7530_set_8021q_port_mode(priv, true);
++		mutex_unlock(&priv->reg_mutex);
++
++		priv->tag_8021q = true;
++		ds->max_num_bridges = DSA_TAG_8021Q_MAX_NUM_BRIDGES;
++
++		err = dsa_tag_8021q_register(ds, htons(ETH_P_8021Q));
++		if (err) {
++			priv->tag_8021q = false;
++			ds->max_num_bridges = 0;
++			mutex_lock(&priv->reg_mutex);
++			mt7530_set_8021q_port_mode(priv, false);
++			mutex_unlock(&priv->reg_mutex);
++			return err;
++		}
++	} else {
++		dsa_tag_8021q_unregister(ds);
++		priv->tag_8021q = false;
++		ds->max_num_bridges = 0;
++
++		mutex_lock(&priv->reg_mutex);
++		mt7530_set_8021q_port_mode(priv, false);
++		mutex_unlock(&priv->reg_mutex);
++	}
++
++	return 0;
++}
++
+ #ifdef CONFIG_GPIOLIB
+ static inline u32
+ mt7530_gpio_to_bit(unsigned int offset)
+@@ -3289,6 +3540,9 @@ static int mt7988_setup(struct dsa_switc
+ 
+ const struct dsa_switch_ops mt7530_switch_ops = {
+ 	.get_tag_protocol	= mtk_get_tag_protocol,
++	.change_tag_protocol	= mt7530_change_tag_protocol,
++	.tag_8021q_vlan_add	= mt7530_tag_8021q_vlan_add,
++	.tag_8021q_vlan_del	= mt7530_tag_8021q_vlan_del,
+ 	.setup			= mt753x_setup,
+ 	.preferred_default_local_cpu_port = mt753x_preferred_default_local_cpu_port,
+ 	.get_strings		= mt7530_get_strings,
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -339,6 +339,7 @@ enum mt7530_vlan_port_acc_frm {
+ };
+ 
+ #define  STAG_VPID			(((x) & 0xffff) << 16)
++#define  MT7530_PVC_TPID(x)		(((x) & 0xffff) << 16)
+ 
+ /* Register for port port-and-protocol based vlan 1 control */
+ #define MT7530_PPBV1_P(x)		(0x2014 + ((x) * 0x100))
+@@ -803,6 +804,7 @@ struct mt7530_port {
+ 	bool isolated;
+ 	u32 pm;
+ 	u16 pvid;
++	u16 pvid_8021q;		/* PVID owned by tag_8021q, mtk-8021q tagging only */
+ 	struct phylink_pcs *sgmii_pcs;
+ };
+ 
+@@ -901,6 +903,7 @@ struct mt7530_priv {
+ 	int (*create_sgmii)(struct mt7530_priv *priv);
+ 	u8 active_cpu_ports;
+ 	struct mdio_device *mdiodev;
++	bool tag_8021q;		/* CPU port uses 802.1Q tags (mtk-8021q), not the MTK tag */
+ };
+ 
+ struct mt7530_hw_vlan_entry {

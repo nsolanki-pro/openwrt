@@ -1,0 +1,170 @@
+From 957f7b17b9da876c46079b2097a8055910b0faa8 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:12 +0530
+Subject: net: dsa: add an 802.1Q-based tagger for MediaTek switches
+
+tag_8021q-based tagging for MT7530-family switches as an alternative to
+the MediaTek special tag (mtk-8021q, modelled on tag_vsc73xx_8021q): the
+CPU port carries standard 802.1Q tags, with tag_8021q's per-port
+standalone VIDs and per-bridge VIDs identifying the source port or
+bridge. A MAC-side offload engine that only parses 802.1Q, such as the
+SF19A2890 GMAC's NAT engine, can then see the frames.
+
+Ports in a bridge use the bridge VID, standalone ports their own.
+
+The tagger provides its own flow_dissect: the generic one skips
+needed_headroom bytes as if the tag were still in the data, but a
+conduit with rx-vlan-offload has already stripped it, so every flow
+hashed alike and RPS put all receive work on one CPU.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ include/net/dsa.h       |  2 +
+ net/dsa/Kconfig         |  8 ++++
+ net/dsa/Makefile        |  1 +
+ net/dsa/tag_mtk_8021q.c | 94 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 105 insertions(+)
+ create mode 100644 net/dsa/tag_mtk_8021q.c
+
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -57,6 +57,7 @@ struct tc_action;
+ #define DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE	29
+ #define DSA_TAG_PROTO_MXL862_VALUE		30
+ #define DSA_TAG_PROTO_MXL862_8021Q_VALUE	31
++#define DSA_TAG_PROTO_MTK_8021Q_VALUE		32
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
+@@ -91,6 +92,7 @@ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_VSC73XX_8021Q	= DSA_TAG_PROTO_VSC73XX_8021Q_VALUE,
+ 	DSA_TAG_PROTO_MXL862		= DSA_TAG_PROTO_MXL862_VALUE,
+ 	DSA_TAG_PROTO_MXL862_8021Q	= DSA_TAG_PROTO_MXL862_8021Q_VALUE,
++	DSA_TAG_PROTO_MTK_8021Q		= DSA_TAG_PROTO_MTK_8021Q_VALUE,
+ };
+ 
+ struct dsa_switch;
+--- a/net/dsa/Kconfig
++++ b/net/dsa/Kconfig
+@@ -118,6 +118,14 @@ config NET_DSA_TAG_MXL_862XX_8021Q
+ 	  MaxLinear MxL86252 and MxL86282 switches using 802.1Q VLAN-based
+ 	  tagging instead of their native 8-byte tagging protocol.
+ 
++config NET_DSA_TAG_MTK_8021Q
++	tristate "Tag driver for Mediatek switches, using VLAN"
++	help
++	  Say Y or M if you want to enable support for tagging frames for
++	  Mediatek switches with an 802.1Q VLAN header (tag_8021q) instead of
++	  the Mediatek special tag, so that a MAC-side offload engine which
++	  only understands 802.1Q can parse the frames.
++
+ config NET_DSA_TAG_KSZ
+ 	tristate "Tag driver for Microchip 8795/937x/9477/9893 families of switches"
+ 	help
+--- a/net/dsa/Makefile
++++ b/net/dsa/Makefile
+@@ -30,6 +30,7 @@ obj-$(CONFIG_NET_DSA_TAG_LAN9303) += tag
+ obj-$(CONFIG_NET_DSA_TAG_MTK) += tag_mtk.o
+ obj-$(CONFIG_NET_DSA_TAG_MXL_862XX) += tag_mxl862xx.o
+ obj-$(CONFIG_NET_DSA_TAG_MXL_862XX_8021Q) += tag_mxl862xx_8021q.o
++obj-$(CONFIG_NET_DSA_TAG_MTK_8021Q) += tag_mtk_8021q.o
+ obj-$(CONFIG_NET_DSA_TAG_NONE) += tag_none.o
+ obj-$(CONFIG_NET_DSA_TAG_OCELOT) += tag_ocelot.o
+ obj-$(CONFIG_NET_DSA_TAG_OCELOT_8021Q) += tag_ocelot_8021q.o
+--- /dev/null
++++ b/net/dsa/tag_mtk_8021q.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * DSA tagger for MediaTek MT7530 switches using 802.1Q VLAN tags
++ * (tag_8021q) instead of the MediaTek special tag. Modelled on
++ * tag_vsc73xx_8021q.c.
++ */
++#include <linux/dsa/8021q.h>
++
++#include "tag.h"
++#include "tag_8021q.h"
++
++#define MTK_8021Q_NAME "mtk-8021q"
++
++static struct sk_buff *mtk_8021q_xmit(struct sk_buff *skb,
++				      struct net_device *netdev)
++{
++	struct dsa_port *dp = dsa_user_to_port(netdev);
++	u16 queue_mapping = skb_get_queue_mapping(skb);
++	u16 tx_vid = dsa_tag_8021q_standalone_vid(dp);
++	u8 pcp;
++
++	/* offload_fwd_mark survives forwarding paths that never pass the
++	 * bridge -- e.g. a frame received on a bridged port and sent by the
++	 * flowtable's direct xmit through a standalone port -- so it only
++	 * means "the hardware may forward this" when the port is bridged
++	 */
++	if (skb->offload_fwd_mark && dsa_port_bridge_dev_get(dp)) {
++		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
++		struct net_device *br = dsa_port_bridge_dev_get(dp);
++
++		if (br_vlan_enabled(br))
++			return skb;
++
++		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
++	}
++
++	pcp = netdev_txq_to_tc(netdev, queue_mapping);
++
++	return dsa_8021q_xmit(skb, netdev, ETH_P_8021Q,
++			      ((pcp << VLAN_PRIO_SHIFT) | tx_vid));
++}
++
++static struct sk_buff *mtk_8021q_rcv(struct sk_buff *skb,
++				     struct net_device *netdev)
++{
++	int src_port = -1, switch_id = -1, vbid = -1, vid = -1;
++
++	dsa_8021q_rcv(skb, &src_port, &switch_id, &vbid, &vid);
++
++	skb->dev = dsa_tag_8021q_find_user(netdev, src_port, switch_id,
++					   vid, vbid);
++	if (!skb->dev) {
++		dev_warn_ratelimited(&netdev->dev,
++				     "Couldn't decode source port\n");
++		return NULL;
++	}
++
++	dsa_default_offload_fwd_mark(skb);
++
++	return skb;
++}
++
++/* The generic DSA flow dissector skips needed_headroom bytes as if the
++ * 802.1Q tag were still in the packet data; when the conduit strips it in
++ * hardware (rx-vlan-offload) that lands inside the IP header, every flow
++ * hashes the same and RPS piles all receive work onto one CPU.
++ */
++static void mtk_8021q_flow_dissect(const struct sk_buff *skb, __be16 *proto,
++				   int *offset)
++{
++	if (skb_vlan_tag_present(skb)) {
++		*offset = 0;
++		*proto = eth_hdr(skb)->h_proto;
++		return;
++	}
++
++	dsa_tag_generic_flow_dissect(skb, proto, offset);
++}
++
++static const struct dsa_device_ops mtk_8021q_netdev_ops = {
++	.name			= MTK_8021Q_NAME,
++	.proto			= DSA_TAG_PROTO_MTK_8021Q,
++	.xmit			= mtk_8021q_xmit,
++	.rcv			= mtk_8021q_rcv,
++	.flow_dissect		= mtk_8021q_flow_dissect,
++	.needed_headroom	= VLAN_HLEN,
++	.promisc_on_conduit	= true,
++};
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("DSA tag driver for MediaTek switches, using VLAN");
++MODULE_ALIAS_DSA_TAG_DRIVER(DSA_TAG_PROTO_MTK_8021Q, MTK_8021Q_NAME);
++
++module_dsa_tag_driver(mtk_8021q_netdev_ops);

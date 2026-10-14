@@ -1,0 +1,67 @@
+From a40ab363218bfc3dfe8dc320639f7a306c387452 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:12 +0530
+Subject: net: dsa: let 802.1Q-style taggers defer GSO to the conduit
+
+A DSA user port inherits the conduit's vlan_features, so behind a
+conduit without TSO it segments every GSO packet itself: each segment
+then goes through the tagger, the conduit's qdisc and its driver one
+at a time.
+
+A tagger whose tag is an ordinary 802.1Q header can let GSO packets
+through instead: skb_gso_segment() on the conduit replicates the VLAN
+header into every segment, after the conduit's qdisc, and the driver
+gets them as one batch (xmit_more). Add gso_on_conduit to
+dsa_device_ops and set it for mtk-8021q; the user port then advertises
+NETIF_F_GSO_SOFTWARE (toggleable with ethtool).
+
+SF19A2890 (stmmac conduit), router-terminated iperf3 over the
+wired WAN port, wan tso on/off on the same boot: TCP up 255 -> 300,
+4-flow TCP up 459 -> 500, UDP up 165 -> 175 Mbit/s.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ include/net/dsa.h       | 4 ++++
+ net/dsa/tag_mtk_8021q.c | 1 +
+ net/dsa/user.c          | 7 +++++++
+ 3 files changed, 12 insertions(+)
+
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -114,6 +114,10 @@ struct dsa_device_ops {
+ 	 * its RX filter.
+ 	 */
+ 	bool promisc_on_conduit;
++	/* The tag is an ordinary 802.1Q header that GSO on the conduit can
++	 * replicate, so user ports may hand GSO packets down unsegmented.
++	 */
++	bool gso_on_conduit;
+ };
+ 
+ struct dsa_lag {
+--- a/net/dsa/tag_mtk_8021q.c
++++ b/net/dsa/tag_mtk_8021q.c
+@@ -85,6 +85,7 @@ static const struct dsa_device_ops mtk_8
+ 	.flow_dissect		= mtk_8021q_flow_dissect,
+ 	.needed_headroom	= VLAN_HLEN,
+ 	.promisc_on_conduit	= true,
++	.gso_on_conduit		= true,
+ };
+ 
+ MODULE_LICENSE("GPL");
+--- a/net/dsa/user.c
++++ b/net/dsa/user.c
+@@ -2719,6 +2719,13 @@ void dsa_user_setup_tagger(struct net_de
+ 	user->hw_features |= NETIF_F_HW_TC;
+ 	if (user->needed_tailroom)
+ 		user->features &= ~(NETIF_F_SG | NETIF_F_FRAGLIST);
++	/* Segment once on the conduit, after its qdisc, instead of passing
++	 * every segment through the tagger and the conduit's qdisc.
++	 */
++	if (cpu_dp->tag_ops->gso_on_conduit && !user->needed_tailroom) {
++		user->features |= NETIF_F_GSO_SOFTWARE;
++		user->hw_features |= NETIF_F_GSO_SOFTWARE;
++	}
+ 	if (ds->needs_standalone_vlan_filtering)
+ 		user->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+ 
