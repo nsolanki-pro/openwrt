@@ -1,0 +1,55 @@
+From 7defd2c2e9d6666802dcb1fd04f25a2da0900fcb Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:40 +0530
+Subject: net: stmmac: kick the TX DMA once per xmit_more batch
+
+stmmac_xmit() wrote the TX poll demand register for every frame. That
+is an uncached MMIO write, and with GSO done on the device (or behind
+a DSA user port that defers GSO to it) frames arrive in runs with
+xmit_more set. Use __netdev_tx_sent_queue() to decide when to flush
+the descriptors and kick the DMA: on the last frame of a batch or when
+the queue stops. Kick on the drop paths too, so frames queued earlier
+in the batch are not left waiting.
+
+Also do the barrier (stmmac_flush_tx_descriptors) before the kick
+rather than after it.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c   | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4881,11 +4881,17 @@ static netdev_tx_t stmmac_xmit(struct sk
+ 
+ 	stmmac_set_tx_owner(priv, first);
+ 
+-	netdev_tx_sent_queue(netdev_get_tx_queue(dev, queue), skb->len);
+-
+-	stmmac_enable_dma_transmission(priv, priv->ioaddr, queue);
+ 	skb_tx_timestamp(skb);
+-	stmmac_flush_tx_descriptors(priv, queue);
++
++	/* Kick the DMA once per batch: the poll demand is an uncached MMIO
++	 * write, and a GSO packet segmented on this device arrives as a
++	 * run of frames with xmit_more set.
++	 */
++	if (__netdev_tx_sent_queue(netdev_get_tx_queue(dev, queue), skb->len,
++				   netdev_xmit_more())) {
++		stmmac_flush_tx_descriptors(priv, queue);
++		stmmac_enable_dma_transmission(priv, priv->ioaddr, queue);
++	}
+ 	stmmac_tx_timer_arm(priv, queue);
+ 
+ 	return NETDEV_TX_OK;
+@@ -4895,6 +4901,9 @@ dma_map_err:
+ max_sdu_err:
+ 	dev_kfree_skb(skb);
+ 	priv->xstats.tx_dropped++;
++	/* Frames queued earlier in this batch may still be waiting */
++	stmmac_flush_tx_descriptors(priv, queue);
++	stmmac_enable_dma_transmission(priv, priv->ioaddr, queue);
+ 	return NETDEV_TX_OK;
+ }
+ 

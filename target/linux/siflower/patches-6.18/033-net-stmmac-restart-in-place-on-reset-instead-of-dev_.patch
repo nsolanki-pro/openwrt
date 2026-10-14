@@ -1,0 +1,83 @@
+From e64ecdac75f9468adac26c9fd282010a140b5858 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:39 +0530
+Subject: net: stmmac: restart in place on reset instead of
+ dev_close()/dev_open()
+
+stmmac_reset_subtask() recovers from a TX timeout with dev_close() and
+dev_open(). Those send NETDEV_GOING_DOWN/NETDEV_DOWN to stacked
+devices, and when the stmmac is a DSA conduit, DSA closes every user
+port in response. Nothing reopens them, so after one TX timeout the
+switch ports stay administratively down and the box drops off the
+network until someone runs "ip link set ... up" on the console.
+
+Restart the MAC and DMA in place instead, the same way an MTU change
+does (stmmac_release() + __stmmac_open() with a fresh DMA conf), so no
+down/up events reach stacked devices. If the new DMA conf can't be
+allocated, nothing has been torn down yet, so fall back to the old
+close/open.
+
+Tested on the SF19A2890 (mt7530 DSA, mtk-8021q tagger) by provoking a
+transmit timeout: "Reset adapter" now keeps lan3/wan up, the WAN lease
+and SSH survive, and the HNAT engine is restored by the open path.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 39 ++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -7231,6 +7231,41 @@ static const struct net_device_ops stmma
+ 	.ndo_hwtstamp_set = stmmac_hwtstamp_set,
+ };
+ 
++/* Restart the MAC and DMA in place, the way an MTU change does.
++ *
++ * dev_close()/dev_open() would send NETDEV_GOING_DOWN/NETDEV_DOWN to
++ * every stacked device: a DSA conduit, for one, takes all of its user
++ * ports down, and nothing brings them back up after the reset.
++ */
++static void stmmac_restart(struct net_device *dev)
++{
++	struct stmmac_priv *priv = netdev_priv(dev);
++	struct stmmac_dma_conf *dma_conf;
++	int ret;
++
++	dma_conf = stmmac_setup_dma_desc(priv, dev->mtu);
++	if (IS_ERR(dma_conf)) {
++		/* Nothing torn down yet: fall back to a full close/open */
++		netdev_err(dev, "failed allocating dma conf for reset\n");
++		dev_close(dev);
++		dev_open(dev, NULL);
++		return;
++	}
++
++	stmmac_release(dev);
++
++	ret = __stmmac_open(dev, dma_conf);
++	if (ret) {
++		free_dma_desc_resources(priv, dma_conf);
++		kfree(dma_conf);
++		netdev_err(dev, "failed reopening the interface after reset\n");
++		return;
++	}
++
++	kfree(dma_conf);
++	stmmac_set_rx_mode(dev);
++}
++
+ static void stmmac_reset_subtask(struct stmmac_priv *priv)
+ {
+ 	if (!test_and_clear_bit(STMMAC_RESET_REQUESTED, &priv->state))
+@@ -7246,8 +7281,8 @@ static void stmmac_reset_subtask(struct
+ 		usleep_range(1000, 2000);
+ 
+ 	set_bit(STMMAC_DOWN, &priv->state);
+-	dev_close(priv->dev);
+-	dev_open(priv->dev, NULL);
++	if (netif_running(priv->dev))
++		stmmac_restart(priv->dev);
+ 	clear_bit(STMMAC_DOWN, &priv->state);
+ 	clear_bit(STMMAC_RESETING, &priv->state);
+ 	rtnl_unlock();

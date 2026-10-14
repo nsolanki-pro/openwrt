@@ -1,0 +1,167 @@
+From 013849a7f6a999f8d1d4628c59b363aab9786baa Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:39 +0530
+Subject: net: stmmac: build the RX skb around the buffer instead of copying it
+
+Without XDP, stmmac_rx() copied every frame into a fresh skb
+(napi_alloc_skb + skb_copy_to_linear_data) and recycled the page,
+syncing up to PAGE_SIZE - 256 bytes back to the device per frame. On
+the non-coherent SF19A2890 that is a 1.5 KB memcpy plus ~3.8 KB of
+cache maintenance for each packet, all on the RX IRQ CPU.
+
+When XDP and split header are off and the buffer fits, split each
+page_pool page into two 2 KB buffers and build the skb around the
+buffer with napi_build_skb(). The page goes back to the pool through
+skb recycling and is synced once, whole, for both halves.
+
+All of the half page the frame does not need goes to headroom (254
+bytes on 32-bit), kept 2 mod 4 so the IP header stays aligned. A
+bridged frame can then take a large TX header without a copy: the
+SF19A2890 WiFi driver needs 252 bytes and copied every frame with
+66.
+
+SF19A2890, router-terminated iperf3 over the wired WAN port: RX IRQ CPU
+softirq 89% -> 40% on a TCP download; a phone download bridged from
+the GMAC to WiFi went from 150-270 to 390-450 Mbit/s.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  | 16 +++++
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 66 +++++++++++++++----
+ 2 files changed, 70 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -128,6 +128,9 @@ struct stmmac_rx_queue {
+ 	unsigned int dirty_rx;
+ 	unsigned int buf_alloc_num;
+ 	unsigned int napi_skb_frag_size;
++	/* RX buffers are page halves that become the skb head (no copy) */
++	bool rx_frag;
++	u32 rx_zeroc_thresh;
+ 	dma_addr_t dma_rx_phy;
+ 	u32 rx_tail_addr;
+ 	unsigned int state_saved;
+@@ -411,6 +414,19 @@ static inline bool stmmac_xdp_is_enabled
+ 	return !!priv->xdp_prog;
+ }
+ 
++/* Without XDP, each RX buffer is half a page and the skb is built around
++ * it instead of copying the frame. The buffer holds the headroom, a
++ * DEFAULT_BUFSIZE (1536) frame and the skb_shared_info; all the space the
++ * frame does not need goes to headroom, kept 2 mod 4 so the IP header
++ * stays aligned. A bridged frame can then take a large TX header in front
++ * (the SF19A2890 WiFi driver needs 252 bytes) instead of being copied.
++ */
++#define STMMAC_RX_FRAG_SIZE	2048
++#define STMMAC_RX_FRAG_HEADROOM						\
++	(ALIGN_DOWN(STMMAC_RX_FRAG_SIZE -				\
++		    SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) -	\
++		    1536 - NET_IP_ALIGN, 4) + NET_IP_ALIGN)
++
+ void stmmac_disable_rx_queue(struct stmmac_priv *priv, u32 queue);
+ void stmmac_enable_rx_queue(struct stmmac_priv *priv, u32 queue);
+ void stmmac_disable_tx_queue(struct stmmac_priv *priv, u32 queue);
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -1443,6 +1443,26 @@ static void stmmac_clear_descriptors(str
+  * Description: this function is called to allocate a receive buffer, perform
+  * the DMA mapping and init the descriptor.
+  */
++static struct page *stmmac_rx_alloc_buf(struct stmmac_priv *priv,
++					struct stmmac_rx_queue *rx_q,
++					struct stmmac_rx_buffer *buf, gfp_t gfp)
++{
++	unsigned int offset;
++
++	if (rx_q->rx_frag) {
++		buf->page = page_pool_alloc_frag(rx_q->page_pool, &offset,
++						 STMMAC_RX_FRAG_SIZE, gfp);
++		if (buf->page)
++			buf->page_offset = offset + STMMAC_RX_FRAG_HEADROOM;
++	} else {
++		buf->page = page_pool_alloc_pages(rx_q->page_pool, gfp);
++		if (buf->page)
++			buf->page_offset = stmmac_rx_offset(priv);
++	}
++
++	return buf->page;
++}
++
+ static int stmmac_init_rx_buffers(struct stmmac_priv *priv,
+ 				  struct stmmac_dma_conf *dma_conf,
+ 				  struct dma_desc *p,
+@@ -1455,12 +1475,8 @@ static int stmmac_init_rx_buffers(struct
+ 	if (priv->dma_cap.host_dma_width <= 32)
+ 		gfp |= GFP_DMA32;
+ 
+-	if (!buf->page) {
+-		buf->page = page_pool_alloc_pages(rx_q->page_pool, gfp);
+-		if (!buf->page)
+-			return -ENOMEM;
+-		buf->page_offset = stmmac_rx_offset(priv);
+-	}
++	if (!buf->page && !stmmac_rx_alloc_buf(priv, rx_q, buf, gfp))
++		return -ENOMEM;
+ 
+ 	if (priv->sph && !buf->sec_page) {
+ 		buf->sec_page = page_pool_alloc_pages(rx_q->page_pool, gfp);
+@@ -2053,6 +2069,19 @@ static int __alloc_dma_rx_desc_resources
+ 		pp_params.max_len += stmmac_rx_offset(priv);
+ 	}
+ 
++	rx_q->rx_frag = !xdp_prog && !priv->sph &&
++			PAGE_SIZE >= 2 * STMMAC_RX_FRAG_SIZE &&
++			STMMAC_RX_FRAG_HEADROOM + dma_conf->dma_buf_sz +
++			SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) <=
++			STMMAC_RX_FRAG_SIZE;
++	if (rx_q->rx_frag) {
++		/* Both halves are synced for the device when the page
++		 * comes back to the pool.
++		 */
++		pp_params.offset = 0;
++		pp_params.max_len = PAGE_SIZE;
++	}
++
+ 	rx_q->page_pool = page_pool_create(&pp_params);
+ 	if (IS_ERR(rx_q->page_pool)) {
+ 		ret = PTR_ERR(rx_q->page_pool);
+@@ -4878,11 +4907,8 @@ static inline void stmmac_rx_refill(stru
+ 		else
+ 			p = rx_q->dma_rx + entry;
+ 
+-		if (!buf->page) {
+-			buf->page = page_pool_alloc_pages(rx_q->page_pool, gfp);
+-			if (!buf->page)
+-				break;
+-		}
++		if (!buf->page && !stmmac_rx_alloc_buf(priv, rx_q, buf, gfp))
++			break;
+ 
+ 		if (priv->sph && !buf->sec_page) {
+ 			buf->sec_page = page_pool_alloc_pages(rx_q->page_pool, gfp);
+@@ -5701,7 +5727,23 @@ read_again:
+ 			}
+ 		}
+ 
+-		if (!skb) {
++		if (!skb && rx_q->rx_frag) {
++			/* No XDP: the buffer itself becomes the skb head */
++			skb = napi_build_skb(page_address(buf->page) +
++					     buf->page_offset -
++					     STMMAC_RX_FRAG_HEADROOM,
++					     STMMAC_RX_FRAG_SIZE);
++			if (!skb) {
++				rx_dropped++;
++				count++;
++				goto drain_data;
++			}
++
++			skb_reserve(skb, STMMAC_RX_FRAG_HEADROOM);
++			skb_put(skb, buf1_len);
++			skb_mark_for_recycle(skb);
++			buf->page = NULL;
++		} else if (!skb) {
+ 			unsigned int head_pad_len;
+ 
+ 			/* XDP program may expand or reduce tail */

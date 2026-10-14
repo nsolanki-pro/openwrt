@@ -1,0 +1,64 @@
+From 9bba1a127d6fefc40cbc0deef285ab01a36d610d Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:12 +0530
+Subject: net: stmmac: add STMMAC_FLAG_RX_FCS_HW_STRIP
+
+Let a platform have the dwmac1000 MAC strip the FCS (GMAC_CONTROL.CST)
+instead of stmmac trimming it in software. On the SF19A2890 the GMAC's
+HNAT engine sits between the MAC and the DMA and forwards RX frames
+straight back to TX; with the FCS left on, each forwarded frame carries
+the stale CRC ahead of the new one and grows by 4 bytes, so full-size
+frames go out oversize and receivers drop them.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 13 +++++++++++--
+ include/linux/stmmac.h                            |  1 +
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3463,6 +3463,13 @@ static int stmmac_hw_setup(struct net_de
+ 	/* Initialize the MAC Core */
+ 	stmmac_core_init(priv, priv->hw, dev);
+ 
++	/* strip the FCS in the MAC (GMAC_CONTROL.CST, dwmac1000) so anything
++	 * between the MAC and the DMA -- e.g. a NAT engine that forwards RX
++	 * frames straight back to TX -- never sees it
++	 */
++	if (priv->plat->flags & STMMAC_FLAG_RX_FCS_HW_STRIP)
++		writel(readl(priv->ioaddr) | BIT(25), priv->ioaddr);
++
+ 	/* Initialize MTL*/
+ 	stmmac_mtl_configuration(priv);
+ 
+@@ -5409,7 +5416,8 @@ read_again:
+ 		len += buf1_len;
+ 
+ 		/* ACS is disabled; strip manually. */
+-		if (likely(!(status & rx_not_ls))) {
++		if (likely(!(status & rx_not_ls)) &&
++		    !(priv->plat->flags & STMMAC_FLAG_RX_FCS_HW_STRIP)) {
+ 			buf1_len -= ETH_FCS_LEN;
+ 			len -= ETH_FCS_LEN;
+ 		}
+@@ -5592,7 +5600,8 @@ read_again:
+ 		len += buf2_len;
+ 
+ 		/* ACS is disabled; strip manually. */
+-		if (likely(!(status & rx_not_ls))) {
++		if (likely(!(status & rx_not_ls)) &&
++		    !(priv->plat->flags & STMMAC_FLAG_RX_FCS_HW_STRIP)) {
+ 			if (buf2_len) {
+ 				buf2_len -= ETH_FCS_LEN;
+ 				len -= ETH_FCS_LEN;
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -191,6 +191,7 @@ enum dwmac_core_type {
+ #define STMMAC_FLAG_EN_TX_LPI_CLOCKGATING	BIT(11)
+ #define STMMAC_FLAG_EN_TX_LPI_CLK_PHY_CAP	BIT(12)
+ #define STMMAC_FLAG_HWTSTAMP_CORRECT_LATENCY	BIT(13)
++#define STMMAC_FLAG_RX_FCS_HW_STRIP		BIT(14)
+ 
+ struct plat_stmmacenet_data {
+ 	enum dwmac_core_type core_type;

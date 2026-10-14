@@ -1,0 +1,128 @@
+From 3e7c72063a78b1f851bc46579049e2f35e54b8ca Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:40 +0530
+Subject: net: stmmac: trust the RX COE verdict with extended descriptors
+
+With extended descriptors (dwmac1000 with ATDS), RDES0 bit 0 means
+"extended status available", but enh_desc_coe_rdes0() reads it as
+"payload checksum error". Every IP frame the COE checked therefore came
+back as csum_none and the stack checksummed it again in software, in
+GRO and in the UDP receive path.
+
+Take the verdict from RDES4 instead: a TCP or UDP payload with no IP
+header error, no payload error and no bypass was checked by the COE.
+Fragments and other payloads keep CHECKSUM_NONE. Frames failing the
+check never get here on the SF19A2890 (DMA OP mode DT=0 drops them).
+
+Also let STMMAC_FLAG_TX_COE_8021Q (now STMMAC_FLAG_COE_8021Q) cover RX:
+the COE looks past one 802.1Q tag, as on TX, and every frame behind
+the mtk-8021q DSA tagger carries one.
+
+SF19A2890, router-terminated iperf3 over the wired WAN port:
+TCP down 400 -> 470-520, 4-flow TCP down 415 -> 600, UDP down
+134 -> 144 Mbit/s with loss 11% -> 2-5%; csum_partial (6% of all CPU
+time on a UDP download) is gone from the profile. Checked with raw
+packets from LAN: bad UDP checksums are still dropped (by the MAC),
+bad checksums in fragmented UDP still count as InCsumErrors, good
+ones still reach UDP.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 60 ++++++++++++++++++-
+ include/linux/stmmac.h                        |  2 +-
+ 2 files changed, 58 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4560,7 +4560,7 @@ static bool stmmac_tx_coe_capable(struct
+ 	int depth = 0;
+ 	__be16 proto;
+ 
+-	if (!(priv->plat->flags & STMMAC_FLAG_TX_COE_8021Q) ||
++	if (!(priv->plat->flags & STMMAC_FLAG_COE_8021Q) ||
+ 	    eth_hdr(skb)->h_proto != htons(ETH_P_8021Q))
+ 		return stmmac_has_ip_ethertype(skb);
+ 
+@@ -4571,6 +4571,58 @@ static bool stmmac_tx_coe_capable(struct
+ 		(proto == htons(ETH_P_IP) || proto == htons(ETH_P_IPV6));
+ }
+ 
++/* Did the RX COE check this frame? As on TX, some cores also look past a
++ * single 802.1Q tag. Called after eth_type_trans(), so skb->data is just
++ * past the Ethernet header, where the tag is.
++ */
++static bool stmmac_rx_coe_capable(struct stmmac_priv *priv,
++				  struct sk_buff *skb)
++{
++	const struct vlan_hdr *vh;
++	__be16 proto;
++
++	if (!(priv->plat->flags & STMMAC_FLAG_COE_8021Q) ||
++	    eth_hdr(skb)->h_proto != htons(ETH_P_8021Q))
++		return stmmac_has_ip_ethertype(skb);
++
++	if (unlikely(skb_headlen(skb) < VLAN_HLEN))
++		return false;
++
++	vh = (const struct vlan_hdr *)skb->data;
++	proto = vh->h_vlan_encapsulated_proto;
++
++	return proto == htons(ETH_P_IP) || proto == htons(ETH_P_IPV6);
++}
++
++/* With extended descriptors, RDES0 bit 0 means "extended status available",
++ * but enh_desc_coe_rdes0() reads it as "payload checksum error", so every
++ * checked IP frame comes back as csum_none and gets checksummed again in
++ * software. The real verdict is in RDES4: trust TCP/UDP payloads the COE
++ * checked without error (fragments and other payloads are not checked).
++ */
++#define STMMAC_RDES4_PAYLOAD_TYPE	GENMASK(2, 0)
++#define STMMAC_RDES4_PAYLOAD_UDP	1
++#define STMMAC_RDES4_PAYLOAD_TCP	2
++
++static bool stmmac_rx_ext_csum_ok(const struct dma_desc *p)
++{
++	const struct dma_extended_desc *ep = (const void *)p;
++	u32 rdes0 = le32_to_cpu(ep->basic.des0);
++	u32 rdes4 = le32_to_cpu(ep->des4);
++	u32 type = rdes4 & STMMAC_RDES4_PAYLOAD_TYPE;
++
++	if (!(rdes0 & RDES0_FRAME_TYPE) || (rdes0 & RDES0_IPC_CSUM_ERROR) ||
++	    !(rdes0 & ERDES0_RX_MAC_ADDR))
++		return false;
++
++	if (rdes4 & (ERDES4_IP_HDR_ERR | ERDES4_IP_PAYLOAD_ERR |
++		     ERDES4_IP_CSUM_BYPASSED))
++		return false;
++
++	return type == STMMAC_RDES4_PAYLOAD_UDP ||
++	       type == STMMAC_RDES4_PAYLOAD_TCP;
++}
++
+ /**
+  *  stmmac_xmit - Tx entry point of the driver
+  *  @skb : the socket buffer
+@@ -5803,8 +5855,10 @@ drain_data:
+ 
+ 		skb->protocol = eth_type_trans(skb, priv->dev);
+ 
+-		if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb) ||
+-		    (status & csum_none))
++		if (unlikely(!coe) || !stmmac_rx_coe_capable(priv, skb) ||
++		    ((status & csum_none) &&
++		     !(priv->extend_desc && priv->hw->rx_csum == STMMAC_RX_COE_TYPE2 &&
++		       stmmac_rx_ext_csum_ok(p))))
+ 			skb_checksum_none_assert(skb);
+ 		else
+ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -192,7 +192,7 @@ enum dwmac_core_type {
+ #define STMMAC_FLAG_EN_TX_LPI_CLK_PHY_CAP	BIT(12)
+ #define STMMAC_FLAG_HWTSTAMP_CORRECT_LATENCY	BIT(13)
+ #define STMMAC_FLAG_RX_FCS_HW_STRIP		BIT(14)
+-#define STMMAC_FLAG_TX_COE_8021Q	BIT(15)
++#define STMMAC_FLAG_COE_8021Q		BIT(15)
+ 
+ struct plat_stmmacenet_data {
+ 	enum dwmac_core_type core_type;

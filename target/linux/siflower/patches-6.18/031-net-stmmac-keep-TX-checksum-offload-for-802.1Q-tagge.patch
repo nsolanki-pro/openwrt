@@ -1,0 +1,75 @@
+From 4bf1aaf92fa1fbd604fbd756aa94149863be7839 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:38 +0530
+Subject: net: stmmac: keep TX checksum offload for 802.1Q-tagged frames
+
+stmmac_has_ip_ethertype() only accepts an IP header right after the
+Ethernet header, so every frame carrying a VLAN tag is checksummed in
+software by skb_checksum_help(). Behind the mt7530's mtk-8021q DSA
+tagger that is every frame the SF19A2890 GMAC sends.
+
+The SF19A2890's DWMAC1000 COE parses a single 802.1Q tag (the vendor
+driver sets checksum insertion on its VLAN WAN frames). Add
+STMMAC_FLAG_TX_COE_8021Q for such cores: frames with exactly one
+802.1Q tag in front of IPv4/IPv6 keep hardware checksumming. Other
+tags (MTK, 802.1ad, QinQ) still fall back to software.
+
+SF19A2890, router-terminated TCP upload over the wan port, same boot, 6
+rounds each: 166 Mbit/s with software checksums (eth0 tx off) vs 204
+Mbit/s with this change.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 23 ++++++++++++++++++-
+ include/linux/stmmac.h                        |  1 +
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4514,6 +4514,27 @@ static bool stmmac_has_ip_ethertype(stru
+ 		(proto == htons(ETH_P_IP) || proto == htons(ETH_P_IPV6));
+ }
+ 
++/* Can the TX COE checksum this frame? Some cores also parse a single
++ * 802.1Q tag, e.g. behind a tag_8021q DSA conduit; without that, every
++ * tagged frame would be checksummed in software.
++ */
++static bool stmmac_tx_coe_capable(struct stmmac_priv *priv,
++				  struct sk_buff *skb)
++{
++	int depth = 0;
++	__be16 proto;
++
++	if (!(priv->plat->flags & STMMAC_FLAG_TX_COE_8021Q) ||
++	    eth_hdr(skb)->h_proto != htons(ETH_P_8021Q))
++		return stmmac_has_ip_ethertype(skb);
++
++	proto = __vlan_get_protocol(skb, eth_header_parse_protocol(skb),
++				    &depth);
++
++	return (depth <= VLAN_ETH_HLEN) &&
++		(proto == htons(ETH_P_IP) || proto == htons(ETH_P_IPV6));
++}
++
+ /**
+  *  stmmac_xmit - Tx entry point of the driver
+  *  @skb : the socket buffer
+@@ -4597,7 +4618,7 @@ static netdev_tx_t stmmac_xmit(struct sk
+ 	 */
+ 	if (csum_insertion &&
+ 	    (priv->plat->tx_queues_cfg[queue].coe_unsupported ||
+-	     !stmmac_has_ip_ethertype(skb))) {
++	     !stmmac_tx_coe_capable(priv, skb))) {
+ 		if (unlikely(skb_checksum_help(skb)))
+ 			goto dma_map_err;
+ 		csum_insertion = !csum_insertion;
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -192,6 +192,7 @@ enum dwmac_core_type {
+ #define STMMAC_FLAG_EN_TX_LPI_CLK_PHY_CAP	BIT(12)
+ #define STMMAC_FLAG_HWTSTAMP_CORRECT_LATENCY	BIT(13)
+ #define STMMAC_FLAG_RX_FCS_HW_STRIP		BIT(14)
++#define STMMAC_FLAG_TX_COE_8021Q	BIT(15)
+ 
+ struct plat_stmmacenet_data {
+ 	enum dwmac_core_type core_type;

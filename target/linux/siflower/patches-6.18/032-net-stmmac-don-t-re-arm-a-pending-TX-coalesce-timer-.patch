@@ -1,0 +1,55 @@
+From be2fa28ba6df3f1b58f53e3e5a5914d2254fc8b4 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:39 +0530
+Subject: net: stmmac: don't re-arm a pending TX coalesce timer for every frame
+
+stmmac_tx_timer_arm() runs for every transmitted frame and calls
+hrtimer_start() each time, only to push an already pending deadline
+back. That takes the hrtimer base lock with interrupts off on the
+transmit hot path, and the TX cleanup NAPI on another CPU contends for
+the same lock.
+
+Leave a queued timer alone: it still fires within tx_coal_timer of the
+first unreclaimed frame, which is sooner than before, so idle flows are
+still reclaimed. The NAPI-scheduled cancel path is unchanged.
+
+On the SF19A2890 (MIPS interAptiv, 800 MHz), router-terminated TCP
+upload over the wan port: 215-226 -> 242-243 Mbit/s with the default
+CPU placement, 261-263 Mbit/s with the sender pinned away from the
+IRQ core. That matches running with the timer disabled entirely
+(tx-usecs 0), which is not safe: it stalled the TX ring into a
+transmit timeout.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c   | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3111,13 +3111,20 @@ static void stmmac_tx_timer_arm(struct s
+ 	/* Arm timer only if napi is not already scheduled.
+ 	 * Try to cancel any timer if napi is scheduled, timer will be armed
+ 	 * again in the next scheduled napi.
++	 *
++	 * A timer that is already pending is left alone: it fires within
++	 * tx_coal_timer of the first unreclaimed frame either way, and
++	 * re-arming it for every frame takes the hrtimer base lock with
++	 * interrupts off on the transmit hot path.
+ 	 */
+-	if (unlikely(!napi_is_scheduled(napi)))
+-		hrtimer_start(&tx_q->txtimer,
+-			      STMMAC_COAL_TIMER(tx_coal_timer),
+-			      HRTIMER_MODE_REL);
+-	else
++	if (unlikely(!napi_is_scheduled(napi))) {
++		if (!hrtimer_is_queued(&tx_q->txtimer))
++			hrtimer_start(&tx_q->txtimer,
++				      STMMAC_COAL_TIMER(tx_coal_timer),
++				      HRTIMER_MODE_REL);
++	} else {
+ 		hrtimer_try_to_cancel(&tx_q->txtimer);
++	}
+ }
+ 
+ /**

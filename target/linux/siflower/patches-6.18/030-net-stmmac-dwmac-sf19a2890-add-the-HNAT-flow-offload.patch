@@ -1,0 +1,90 @@
+From b0a34ff22a7ad85b7306f30fdaec4575bfaf8f0e Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:38 +0530
+Subject: net: stmmac: dwmac-sf19a2890: add the HNAT flow offload engine
+
+The SF19A2890 GMAC has a hardware NAT engine between the MAC and the
+DMA. For a flow in its tables it rewrites addresses, ports, the VLAN
+tag and checksums and sends the frame straight back out, without the
+CPU.
+
+Offload nf_flow_table flows to it through TC_SETUP_FT, modelled on
+mtk_ppe_offload.c, with the table layout from the vendor SDK:
+- IPv4 TCP/UDP, SNAT/masquerade with a single WAN.
+- Flows between DSA user ports behind the mtk-8021q tagger, identified
+  by their VLAN.
+- PPPoE WAN and off-link destinations (gateway MAC).
+- Tables in big-endian mode, as the vendor driver programs them.
+- The engine shares the DMA reset: tables are restored after every
+  MAC/DMA reinitialisation through hw_setup_done.
+
+The engine is opt-in per board with the siflower,hnat DT property. Its
+state lives in a per-device struct allocated by the GMAC driver, and it
+uses the GMAC's own mapping, which covers the HNAT block. debugfs has
+read-only views of the registers and tables.
+
+The engine has no per-flow hit counters, so offloaded flows are not
+refreshed from hardware statistics. Its aging timers keep their reset
+values, as in the vendor driver.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/Kconfig       | 10 ++++++++++
+ drivers/net/ethernet/stmicro/stmmac/Makefile      |  1 +
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c |  5 +++++
+ include/linux/stmmac.h                            |  1 +
+ 4 files changed, 17 insertions(+)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/Kconfig
++++ b/drivers/net/ethernet/stmicro/stmmac/Kconfig
+@@ -189,6 +189,16 @@ config DWMAC_SF19A2890
+ 	  This selects the Siflower SF19A2890 SoC glue layer support for
+ 	  the stmmac device driver.
+ 
++config SF19A2890_HNAT
++	tristate "Siflower SF19A2890 hardware NAT offload"
++	depends on DWMAC_SF19A2890
++	depends on NET_DSA || !NET_DSA
++	help
++	  Offload nf_flow_table flows (IPv4 TCP/UDP NAPT) to the hardware
++	  NAT engine in the SF19A2890 GMAC. Enabled per board with the
++	  siflower,hnat DT property. Build it in when the GMAC driver is
++	  built in.
++
+ config DWMAC_SOCFPGA
+ 	tristate "SOCFPGA dwmac support"
+ 	default ARCH_INTEL_SOCFPGA
+--- a/drivers/net/ethernet/stmicro/stmmac/Makefile
++++ b/drivers/net/ethernet/stmicro/stmmac/Makefile
+@@ -23,6 +23,7 @@ obj-$(CONFIG_DWMAC_QCOM_ETHQOS)	+= dwmac
+ obj-$(CONFIG_DWMAC_RENESAS_GBETH) += dwmac-renesas-gbeth.o
+ obj-$(CONFIG_DWMAC_ROCKCHIP)	+= dwmac-rk.o
+ obj-$(CONFIG_DWMAC_SF19A2890)	+= dwmac-sf19a2890.o
++obj-$(CONFIG_SF19A2890_HNAT)	+= sf19a2890-hnat.o
+ obj-$(CONFIG_DWMAC_RZN1)	+= dwmac-rzn1.o
+ obj-$(CONFIG_DWMAC_S32)		+= dwmac-s32.o
+ obj-$(CONFIG_DWMAC_SOCFPGA)	+= dwmac-altr-socfpga.o
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -6274,6 +6274,11 @@ static int stmmac_setup_tc(struct net_de
+ 						  &stmmac_block_cb_list,
+ 						  stmmac_setup_tc_block_cb,
+ 						  priv, priv, true);
++	case TC_SETUP_FT:
++		if (priv->plat->setup_tc_ft)
++			return priv->plat->setup_tc_ft(ndev, priv->plat->bsp_priv,
++						       type_data);
++		return -EOPNOTSUPP;
+ 	case TC_SETUP_QDISC_CBS:
+ 		return stmmac_tc_setup_cbs(priv, priv, type_data);
+ 	case TC_SETUP_QDISC_TAPRIO:
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -275,6 +275,7 @@ struct plat_stmmacenet_data {
+ 	void (*pcs_exit)(struct stmmac_priv *priv);
+ 	struct phylink_pcs *(*select_pcs)(struct stmmac_priv *priv,
+ 					  phy_interface_t interface);
++	int (*setup_tc_ft)(struct net_device *ndev, void *priv, void *type_data);
+ 	/* called at the end of every MAC/DMA (re)initialisation -- open,
+ 	 * MTU/ring reconfiguration, resume -- after the DMA soft reset
+ 	 */

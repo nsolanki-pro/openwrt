@@ -1,0 +1,41 @@
+From b0a6017a89866db1a9e7de0740419e21fbf426e7 Mon Sep 17 00:00:00 2001
+From: Naresh Solanki <naresh.solanki.2011@gmail.com>
+Date: Thu, 8 Oct 2026 23:31:24 +0530
+Subject: net: stmmac: add a hw_setup_done platform callback
+
+Called at the end of stmmac_hw_setup(), i.e. after every MAC/DMA
+(re)initialisation: open, MTU or ring reconfiguration, resume. Lets a
+platform restore state that the DMA soft reset wipes; on the SF19A2890
+that is the GMAC's HNAT engine, which sits behind the same reset.
+
+Signed-off-by: Naresh Solanki <naresh.solanki.2011@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 3 +++
+ include/linux/stmmac.h                            | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3556,6 +3556,9 @@ static int stmmac_hw_setup(struct net_de
+ 	stmmac_set_hw_vlan_mode(priv, priv->hw);
+ 	phylink_rx_clk_stop_unblock(priv->phylink);
+ 
++	if (priv->plat->hw_setup_done)
++		priv->plat->hw_setup_done(dev, priv->plat->bsp_priv);
++
+ 	return 0;
+ }
+ 
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -275,6 +275,10 @@ struct plat_stmmacenet_data {
+ 	void (*pcs_exit)(struct stmmac_priv *priv);
+ 	struct phylink_pcs *(*select_pcs)(struct stmmac_priv *priv,
+ 					  phy_interface_t interface);
++	/* called at the end of every MAC/DMA (re)initialisation -- open,
++	 * MTU/ring reconfiguration, resume -- after the DMA soft reset
++	 */
++	void (*hw_setup_done)(struct net_device *ndev, void *priv);
+ 	void *bsp_priv;
+ 	struct clk *stmmac_clk;
+ 	struct clk *pclk;

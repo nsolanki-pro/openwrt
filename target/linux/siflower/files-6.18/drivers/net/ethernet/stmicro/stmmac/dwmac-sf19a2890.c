@@ -16,9 +16,11 @@
 
 #include "stmmac.h"
 #include "stmmac_platform.h"
+#include "sf19a2890-hnat.h"
 
 struct sf19a2890_gmac_priv {
 	struct device *dev;
+	struct sf19a2890_hnat *hnat;
 	void __iomem *gmac_cfg;
 	struct clk *gmac_byp_ref_clk;
 };
@@ -110,11 +112,28 @@ static int sfgmac_setup_phy_interface(struct sf19a2890_gmac_priv *priv)
 	return 0;
 }
 
+static int sf19a2890_gmac_setup_tc_ft(struct net_device *ndev, void *bsp_priv,
+				      void *type_data)
+{
+	struct sf19a2890_gmac_priv *priv = bsp_priv;
+
+	return sf19a2890_hnat_setup_tc_ft(priv->hnat, ndev, type_data);
+}
+
+static void sf19a2890_gmac_hw_setup_done(struct net_device *ndev, void *bsp_priv)
+{
+	struct sf19a2890_gmac_priv *priv = bsp_priv;
+
+	sf19a2890_hnat_hw_setup_done(priv->hnat);
+}
+
 static int sf19a2890_gmac_probe(struct platform_device *pdev)
 {
 	struct plat_stmmacenet_data *plat_dat;
 	struct sf19a2890_gmac_priv *priv;
 	struct stmmac_resources stmmac_res;
+	struct net_device *ndev;
+	bool hnat;
 	int ret;
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
@@ -152,10 +171,51 @@ static int sf19a2890_gmac_probe(struct platform_device *pdev)
 	}
 
 	plat_dat->bsp_priv = priv;
+	/* The COE parses one 802.1Q tag on TX and RX (the vendor driver
+	 * relies on it for its VLAN WAN), which lets the mtk-8021q tagger's
+	 * frames keep hardware checksumming both ways.
+	 */
+	plat_dat->flags |= STMMAC_FLAG_COE_8021Q;
+	/* The HNAT engine only works when the switch hands the GMAC plain
+	 * Ethernet/802.1Q frames: behind the DSA MediaTek tag it cannot parse
+	 * anything, and the MAC's FCS stripping (type frames only) would
+	 * misread the tag as an 802.3 length. Opt in per board.
+	 */
+	hnat = IS_REACHABLE(CONFIG_SF19A2890_HNAT) &&
+	       of_property_read_bool(pdev->dev.of_node, "siflower,hnat");
+	if (hnat) {
+		priv->hnat = sf19a2890_hnat_probe(&pdev->dev, stmmac_res.addr);
+		if (IS_ERR(priv->hnat)) {
+			dev_warn(&pdev->dev, "no NAT offload: %pe\n", priv->hnat);
+			hnat = false;
+		}
+	}
+	if (hnat) {
+		plat_dat->setup_tc_ft = sf19a2890_gmac_setup_tc_ft;
+		plat_dat->hw_setup_done = sf19a2890_gmac_hw_setup_done;
+		/* the HNAT engine forwards RX frames to TX as received: with
+		 * the FCS left on, every forwarded frame grows by 4 bytes
+		 * (a stale CRC ahead of the new one)
+		 */
+		plat_dat->flags |= STMMAC_FLAG_RX_FCS_HW_STRIP;
+	}
 
 	ret = stmmac_pltfr_probe(pdev, plat_dat, &stmmac_res);
+	if (ret)
+		return ret;
 
-	return ret;
+	/* stmmac_dvr_probe() calls SET_NETDEV_DEV() (which only sets
+	 * dev.parent) but never propagates the OF node to the netdev's own
+	 * dev.of_node. DSA switch drivers dereference conduit->dev.of_node
+	 * directly (e.g. mt7530_setup: cpu_dp->conduit->dev.of_node->parent),
+	 * so a DSA conduit without this NULL-derefs on probe. DSA's conduit
+	 * lookup (of_find_net_device_by_node) still matches via the parent
+	 * chain, so the crash only surfaces inside the switch driver. Set it.
+	 */
+	ndev = platform_get_drvdata(pdev);
+	ndev->dev.of_node = pdev->dev.of_node;
+
+	return 0;
 }
 
 static const struct of_device_id dwmac_sf19a2890_match[] = {
