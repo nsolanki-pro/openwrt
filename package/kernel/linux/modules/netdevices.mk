@@ -909,6 +909,45 @@ endef
 $(eval $(call KernelPackage,dsa-qca8k))
 
 
+define KernelPackage/dsa-mt7530
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=MediaTek MT7530/MT7531 switch DSA support
+  DEPENDS:=+kmod-dsa +kmod-regmap-core
+  KCONFIG:= \
+	CONFIG_NET_DSA_MT7530 \
+	CONFIG_NET_DSA_MT7530_MDIO \
+	CONFIG_NET_DSA_MT7530_MMIO=n \
+	CONFIG_NET_DSA_TAG_MTK \
+	CONFIG_NET_DSA_TAG_MTK_8021Q \
+	CONFIG_MEDIATEK_GE_PHY \
+	CONFIG_MTK_NET_PHYLIB \
+	CONFIG_PCS_MTK_LYNXI
+  FILES:= \
+	$(LINUX_DIR)/drivers/net/dsa/mt7530.ko \
+	$(LINUX_DIR)/drivers/net/dsa/mt7530-mdio.ko \
+	$(LINUX_DIR)/net/dsa/tag_mtk.ko \
+	$(LINUX_DIR)/net/dsa/tag_mtk_8021q.ko \
+	$(LINUX_DIR)/drivers/net/pcs/pcs-mtk-lynxi.ko
+  # mtk-ge.ko and mtk-phy-lib.ko are still *built* (NET_DSA_MT7530_MDIO
+  # select-s MEDIATEK_GE_PHY, and mtk-ge depends on MTK_NET_PHYLIB), but are
+  # intentionally NOT shipped here: on an MT7530-RGMII board the switch's
+  # internal FE PHYs bind to the generic PHY driver, so the MediaTek GE PHY
+  # driver never attaches. pcs-mtk-lynxi MUST stay -- mt7530-mdio.ko
+  # hard-depends on it (calls mtk_pcs_lynxi_create/destroy).
+  AUTOLOAD:=$(call AutoLoad,44,pcs-mtk-lynxi tag_mtk tag_mtk_8021q mt7530 mt7530-mdio,1)
+endef
+
+define KernelPackage/dsa-mt7530/description
+  DSA kernel modules for the MediaTek MT7530/MT7531 Ethernet switch chips
+  (MDIO-attached). Bundles the MTK tag driver and the LynxI PCS helper that
+  mt7530-mdio hard-depends on. The MediaTek GE PHY / PHY library are
+  select-forced build artifacts (see NET_DSA_MT7530_MDIO Kconfig) but are
+  not shipped -- unused on MT7530 boards whose CPU port is RGMII.
+endef
+
+$(eval $(call KernelPackage,dsa-mt7530))
+
+
 define KernelPackage/dsa-realtek
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Realtek common module RTL83xx DSA switch family
